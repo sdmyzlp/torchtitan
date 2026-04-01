@@ -23,6 +23,33 @@ from torch.distributed.tensor import (
 from torch.distributed.tensor.parallel import ParallelStyle
 
 import torch_npu
+import torch.library
+
+
+# Register torch_npu.npu_grouped_matmul as the PrivateUse1 (NPU) implementation for aten::_grouped_mm
+# Signature: aten::_grouped_mm(Tensor self, Tensor mat2, Tensor? offs=None, Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor
+@torch.library.impl("aten::_grouped_mm", "PrivateUse1")
+def npu_grouped_matmul(
+    self: torch.Tensor,
+    mat2: torch.Tensor,
+    offs: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    # output = x @ w                        [SEQ, IN] @ [GROUP, IN, OUT]
+    # dx     = grad @ w.transpose(-1, -2)   [SEQ, OUT] @ [GROUP, OUT, IN]
+    # dw     = x.T @ grad                   [IN, SEQ] @ [SEQ, OUT]
+    is_dw = self.dim() == 2 and mat2.dim() == 2
+
+    return torch_npu.npu_grouped_matmul(
+        [self],
+        [mat2],
+        group_list=offs,
+        group_list_type=1,
+        split_item=2,
+        # `offs` stands for splits along k-axis when computing dw.
+        group_type=(2 if is_dw else 0),
+    )[0]
 
 
 @torch.library.custom_op("tt::npu_moe_token_unpermute", mutates_args=())
