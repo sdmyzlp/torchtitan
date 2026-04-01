@@ -22,7 +22,45 @@ from torch.distributed.tensor import (
 )
 from torch.distributed.tensor.parallel import ParallelStyle
 
-from torchtitan.models.common.moe.utils import _permute, _unpermute
+import torch_npu
+
+
+@torch.library.custom_op("tt::npu_moe_token_unpermute", mutates_args=())
+def npu_moe_token_unpermute(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+) -> torch.Tensor:
+    return torch_npu.npu_moe_token_unpermute(
+        permuted_tokens,
+        sorted_indices,
+        probs=None,
+        padded_mode=False,
+    )
+
+
+def _setup_context(ctx, inputs, output):
+    _, sorted_indices = inputs
+    ctx.save_for_backward(sorted_indices)
+
+
+def _backward(ctx, grad_output):
+    (sorted_indices,) = ctx.saved_tensors
+
+    # The `permuted_tokens` argument is not used by npu_moe_token_unpermute_grad
+    # when `probs` is None. Provide a dummy tensor as an temporary workaround.
+    dummy = torch.empty([grad_output.shape[0], 0])
+    grad_permuted, _ = torch_npu.npu_moe_token_unpermute_grad(
+        dummy,
+        grad_output,
+        sorted_indices,
+        None,
+        False,
+        None,
+    )
+    return grad_permuted, None
+
+
+npu_moe_token_unpermute.register_autograd(_backward, setup_context=_setup_context)
 
 
 class BaseExpertParallel(ParallelStyle, ABC):
@@ -100,11 +138,6 @@ class ExpertParallel(BaseExpertParallel):
                 None,
                 group=device_mesh.get_group(),
             )
-            # Need to wait explicitly because it is used by a triton kernel later
-            # which doesn't realize that AsyncCollectiveTensor needs unwrapping
-            num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
-                num_tokens_per_expert_group
-            )
             input_splits = (
                 num_tokens_per_expert.view(ep_degree, -1)
                 .sum(dim=1)
@@ -133,28 +166,30 @@ class ExpertParallel(BaseExpertParallel):
         # Rather, it is of the format
         # [#tokens for local expert 0 from EP rank 0, #tokens for local expert 1 from EP rank 0, ...,
         #  #tokens for local expert 0 from EP rank 1, #tokens for local expert 1 from EP rank 1, ...]
-        # We need to perform another shuffle to get the correct layout, via the _permute function
-        # below, which also does padding to make sure the number of tokens each expert gets locally
-        # is a multiple of TOKEN_GROUP_ALIGN_SIZE_M.
-        # Note that this will create side effects when wrapping the for-loop implementation
-        # of GroupedExperts, as it does not need padding.
+        # We need to perform another shuffle to get the correct layout.
+        # On NPU, torch._grouped_mm doesn't need any padding so all padding-related logic is removed.
 
-        (
-            self.input_shape,
-            routed_input,
-            self.permuted_indices,
-            num_tokens_per_expert_group,
-        ) = _permute(
-            routed_input, num_tokens_per_expert_group, ep_degree, num_local_experts
+        with torch.no_grad():
+            indices = (
+                torch.arange(num_local_experts, dtype=torch.int64)
+                .repeat(ep_degree)
+                .repeat_interleave(
+                    num_tokens_per_expert_group.view(-1),
+                    output_size=sum(self.output_splits),
+                )
+            )
+
+        routed_input, self.permuted_indices = torch_npu.npu_moe_token_permute(
+            routed_input, indices
         )
-
         return routed_input, num_tokens_per_expert_group
 
     def _token_combine(
         self, mod: nn.Module, routed_output: Tensor, device_mesh: DeviceMesh
     ) -> Tensor:
-        routed_output = _unpermute(
-            routed_output, self.input_shape, self.permuted_indices
+        routed_output = torch.ops.tt.npu_moe_token_unpermute(
+            routed_output,
+            self.permuted_indices,
         )
 
         routed_output = all_to_all_single_autograd(
