@@ -35,6 +35,10 @@ from .model import Qwen35Model
 
 
 class Qwen35StateDictAdapter(StateDictAdapter):
+    # Qwen3.5 is multimodal: the text embedding is nested under
+    # ``model.language_model`` in the HF naming.
+    hf_embed_tokens_key: str = "model.language_model.embed_tokens.weight"
+
     def __init__(self, model_config: Qwen35Model.Config, hf_assets_path: str | None):
         super().__init__(model_config, hf_assets_path)
         self.model_config = model_config
@@ -183,10 +187,6 @@ class Qwen35StateDictAdapter(StateDictAdapter):
             else:
                 if tt_key not in to_hf_map:
                     continue
-                if tt_key == "lm_head.weight" and getattr(
-                    self.model_config, "enable_weight_tying", False
-                ):
-                    continue
                 hf_value = value
                 # Linear weight (out, C*T*H*W) → Conv3d weight (out, C, T, H, W)
                 if tt_key == "vision_encoder.patch_embed.weight":
@@ -237,20 +237,15 @@ class Qwen35StateDictAdapter(StateDictAdapter):
                     f"model.language_model.layers.{layer_num}.linear_attn.conv1d.weight"
                 ] = torch.cat([cq, ck, cv], dim=0)
 
+        self._drop_tied_lm_head(hf_state_dict)
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert HuggingFace Qwen3.5 state dict to torchtitan format."""
         tt_state_dict = {}
 
-        # HF ties lm_head with embed_tokens — copy if missing
-        if "lm_head.weight" not in hf_state_dict:
-            embed_key = "model.language_model.embed_tokens.weight"
-            if embed_key not in hf_state_dict:
-                raise ValueError(
-                    f"HF checkpoint missing both 'lm_head.weight' and '{embed_key}'"
-                )
-            hf_state_dict["lm_head.weight"] = hf_state_dict[embed_key]
+        # HF stores tied models without lm_head.weight; recreate it if missing.
+        self._tie_lm_head(hf_state_dict)
 
         for hf_key, value in hf_state_dict.items():
             if re.search(r"\.\d+\.", hf_key):

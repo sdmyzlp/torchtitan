@@ -173,18 +173,10 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
             else:
                 if key not in to_hf_map:
                     continue
-                # pyrefly: ignore [missing-attribute]
-                if self.model_config.enable_weight_tying and key == "lm_head.weight":
-                    continue
                 new_key = to_hf_map[key]
                 hf_state_dict[new_key] = value
 
-        if self.fqn_to_index_mapping is not None:
-            self.fqn_to_index_mapping = {
-                k: v for k, v in self.fqn_to_index_mapping.items()
-                if k in hf_state_dict
-            }
-
+        self._drop_tied_lm_head(hf_state_dict)
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -202,13 +194,7 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
         if self.fuse_qkv:
             n_heads, n_kv_heads, head_dim = self._get_attention_dims()
 
-        if (
-            # pyrefly: ignore [missing-attribute]
-            self.model_config.enable_weight_tying
-            and "lm_head.weight" not in hf_state_dict
-        ):
-            assert "model.embed_tokens.weight" in hf_state_dict
-            hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
+        self._tie_lm_head(hf_state_dict)
 
         for key, value in hf_state_dict.items():
             if "mlp.experts" in key:

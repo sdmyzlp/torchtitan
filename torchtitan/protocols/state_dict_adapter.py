@@ -81,6 +81,13 @@ class BaseStateDictAdapter(ABC):
 class StateDictAdapter(BaseStateDictAdapter):
     """State dict adapter base class which provides convenient default behavior to build fqn_to_index_mapping"""
 
+    # HF FQNs for the LM head and the input embedding. Subclasses whose HF
+    # naming differs (e.g. a multimodal model nesting the text embedding under
+    # ``model.language_model.``) override ``hf_embed_tokens_key``. ``lm_head``
+    # is ``lm_head.weight`` across the decoders we support.
+    hf_lm_head_key: str = "lm_head.weight"
+    hf_embed_tokens_key: str = "model.embed_tokens.weight"
+
     def __init__(
         self,
         model_config: BaseModel.Config,
@@ -106,10 +113,62 @@ class StateDictAdapter(BaseStateDictAdapter):
                     # pyrefly: ignore [missing-attribute]
                     indx = re.search(r"\d+", raw_indx).group(0)
                     self.fqn_to_index_mapping[hf_key] = int(indx)
+                self._drop_tied_lm_head_from_index_mapping()
             else:
                 self.fqn_to_index_mapping = None
         else:
             self.fqn_to_index_mapping = None
+
+    def _drop_tied_lm_head_from_index_mapping(self) -> None:
+        """Drop the stale ``lm_head.weight`` entry when weight tying is on.
+
+        ``fqn_to_index_mapping`` is loaded verbatim from
+        ``model.safetensors.index.json`` and may map ``lm_head.weight`` to its
+        own safetensors shard. Under weight tying, ``to_hf`` aliases
+        ``lm_head.weight`` to ``model.embed_tokens.weight`` and never emits it,
+        so leaving the entry makes ``HuggingFaceStorageWriter`` write an empty,
+        unreadable shard for the absent key. Removing it here keeps the mapping
+        consistent with what ``to_hf`` produces for every weight-tied decoder
+        (llama3, qwen3, qwen3_5, ...). Weight tying is incompatible with
+        pipeline parallelism (see ``Decoder.Config``), so this config-driven
+        correction is identical on every rank and safe for consolidation.
+        """
+        if self.fqn_to_index_mapping is None:
+            return
+        if getattr(self.model_config, "enable_weight_tying", False):
+            self.fqn_to_index_mapping.pop(self.hf_lm_head_key, None)
+
+    def _drop_tied_lm_head(self, hf_state_dict: dict[str, Any]) -> None:
+        """Drop ``lm_head`` from a to_hf state dict when weight tying is on.
+
+        Tied decoders share one tensor between the LM head and the input
+        embedding, so the HF checkpoint stores only the embedding (matching
+        ``tie_word_embeddings=true``). Call this at the end of ``to_hf``; it is
+        the activation-dict counterpart to
+        ``_drop_tied_lm_head_from_index_mapping`` and keeps both consistent.
+        """
+        if getattr(self.model_config, "enable_weight_tying", False):
+            hf_state_dict.pop(self.hf_lm_head_key, None)
+
+    def _tie_lm_head(self, hf_state_dict: dict[str, Any]) -> None:
+        """Reconstruct ``lm_head`` from the embedding when the HF dict omits it.
+
+        HF stores tied models without ``lm_head.weight`` (it aliases the input
+        embedding). Whenever the LM head is absent we recreate it from the
+        embedding so the torchtitan model -- whether it ties the weight or keeps
+        a separate head -- has both keys. Gating on absence (rather than on
+        ``enable_weight_tying``) is required because a model may keep an
+        untied head locally yet load a tied HF checkpoint. Call this at the top
+        of ``from_hf``.
+        """
+        if self.hf_lm_head_key in hf_state_dict:
+            return
+        if self.hf_embed_tokens_key not in hf_state_dict:
+            raise ValueError(
+                f"HF checkpoint missing both {self.hf_lm_head_key!r} and "
+                f"{self.hf_embed_tokens_key!r}; cannot reconstruct the LM head."
+            )
+        hf_state_dict[self.hf_lm_head_key] = hf_state_dict[self.hf_embed_tokens_key]
 
     def _validate_hf_rope_config(
         self,

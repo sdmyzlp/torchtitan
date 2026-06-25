@@ -147,25 +147,16 @@ class Llama3StateDictAdapter(StateDictAdapter):
 
                 new_key = new_key.format(layer_num)
             else:
-                if (
-                    self.model_config.enable_weight_tying  # pyrefly: ignore [missing-attribute]
-                    and key == "lm_head.weight"
-                ):
-                    continue
                 new_key = to_hf_map[key]
 
             hf_state_dict[new_key] = value
 
+        self._drop_tied_lm_head(hf_state_dict)
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         self._validate_hf_rope_config(ComplexRoPE.Config)
-        if (
-            self.model_config.enable_weight_tying  # pyrefly: ignore [missing-attribute]
-            and "lm_head.weight" not in hf_state_dict
-        ):
-            assert "model.embed_tokens.weight" in hf_state_dict
-            hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
+        self._tie_lm_head(hf_state_dict)
 
         # pyrefly: ignore [missing-attribute]
         attn = self.model_config.layers[0].attention
