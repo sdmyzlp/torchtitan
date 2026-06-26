@@ -72,6 +72,13 @@ class Attention(BaseAttention):
 
         # Standard attention softmax scale (1/sqrt(head_dim))
         self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
+        # YaRN attention "mscale": the rope is now a pure rotation (this factor
+        # used to be baked into the rope cos/sin). Apply the magnitude factor
+        # (mscale**2 -- equivalent to scaling q and k each by mscale) here in the
+        # softmax scale instead. See _yarn_inv_freq in models/common/rope.py.
+        if config.rope.scaling == "yarn" and config.rope.rope_factor > 1.0:
+            mscale = 0.1 * math.log(config.rope.rope_factor) + 1.0
+            self.softmax_scale *= mscale * mscale
 
         self.qkv_linear = config.qkv_linear.build()
         self.wo = config.wo.build()

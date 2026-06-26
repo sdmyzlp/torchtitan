@@ -61,7 +61,6 @@ class RoPE(Module):
         beta_fast: float = 32.0
         beta_slow: float = 1.0
         original_seq_len: int = 4096
-        mscale: float = 0.0
         # Floor/ceil the YaRN correction range (DeepSeek style). gpt-oss uses
         # fractional cutoffs (``truncate=False``).
         truncate: bool = True
@@ -283,14 +282,13 @@ class CosSinRoPE(RoPE):
         max_seq_len = cfg.max_seq_len
         base = cfg.theta
 
-        mscale = 1.0
-
         if cfg.scaling == "llama":
             raise NotImplementedError("Cos/sin RoPE does not support Llama scaling.")
 
         if cfg.scaling == "yarn" and cfg.rope_factor > 1.0:
-            mscale = 0.1 * math.log(cfg.rope_factor) + 1.0
-            # Shared YaRN math; mscale applied separately (see cos/sin below).
+            # Shared YaRN math (pure rotation). The YaRN attention "mscale" is
+            # applied by the model in its softmax scale, not baked into the rope
+            # cos/sin -- see _yarn_inv_freq.
             inv_freq = _yarn_inv_freq(
                 dim,
                 base,
@@ -309,8 +307,8 @@ class CosSinRoPE(RoPE):
         freqs = torch.outer(t, inv_freq).float()
         theta = torch.cat([freqs, freqs], dim=-1)
 
-        cos = theta.cos() * mscale
-        sin = theta.sin() * mscale
+        cos = theta.cos()
+        sin = theta.sin()
         return torch.cat([cos, sin], dim=-1)
 
     def _reshape_cache(
