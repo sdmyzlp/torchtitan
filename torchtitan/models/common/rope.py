@@ -305,11 +305,10 @@ class CosSinRoPE(RoPE):
 
         t = torch.arange(max_seq_len, dtype=inv_freq.dtype, device=inv_freq.device)
         freqs = torch.outer(t, inv_freq).float()
-        theta = torch.cat([freqs, freqs], dim=-1)
-
-        cos = theta.cos()
-        sin = theta.sin()
-        return torch.cat([cos, sin], dim=-1)
+        cis = torch.polar(torch.ones_like(freqs), freqs)
+        cos_dup = torch.cat([cis.real, cis.real], dim=-1)
+        sin_dup = torch.cat([cis.imag, cis.imag], dim=-1)
+        return torch.cat([cos_dup, sin_dup], dim=-1)
 
     def _reshape_cache(
         self,
