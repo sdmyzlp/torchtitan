@@ -780,6 +780,85 @@ class ChunkedLossWrapper(BaseLoss):
         )
 
 
+class MTPAwareLoss(BaseLoss):
+    """Loss that adds MTP auxiliary losses on top of a main cross-entropy loss.
+
+    Expects ``pred`` to be the concatenated MTP block output of shape
+    ``[B, (D + 1) * L, dim]`` where ``D = mtp_config.num_layers``.  The
+    first ``L`` tokens form the main-model output; the remaining ``D * L``
+    tokens are per-depth MTP outputs.
+
+    ``lm_head`` is applied inside this loss to convert hidden_states to
+    logits for both the main and auxiliary losses.  The main loss uses an
+    inner ``loss_fn`` (e.g. ``CrossEntropyLoss``) that receives logits.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseLoss.Config):
+        loss_fn: BaseLoss.Config = field(default_factory=CrossEntropyLoss.Config)
+        """Loss applied to the main-model logits."""
+
+        global_vocab_size: int | None = None
+        """Full vocabulary size, needed for spmd_types loss-parallel CE."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        compile_config: CompileConfig | None = None,
+    ):
+        self.inner_loss: BaseLoss = config.loss_fn.build(
+            compile_config=compile_config
+        )
+        self.global_vocab_size = config.global_vocab_size
+        self.lm_head: nn.Module | None = None
+        from torchtitan.models.common.mtp import MTPConfig
+
+        self.mtp_config: MTPConfig | None = None
+
+    def set_lm_head(self, lm_head: nn.Module) -> None:
+        self.lm_head = lm_head
+
+    def set_mtp(self, mtp_config) -> None:  # pyrefly: ignore[unused-parameter]
+        self.mtp_config = mtp_config
+
+    def __call__(
+        self,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        global_valid_tokens: float | None = None,
+        **loss_inputs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        D = self.mtp_config.num_layers if self.mtp_config is not None else 0
+        assert self.lm_head is not None
+
+        if D == 0:
+            logits = self.lm_head(pred)
+            return self.inner_loss(
+                logits, labels, global_valid_tokens, **loss_inputs
+            )
+
+        from torchtitan.models.common.mtp import mtp_auxiliary_loss
+
+        # Split concatenated pred: first L tokens = main, rest = MTP depths
+        L = pred.shape[1] // (D + 1)
+        main_h = pred[:, :L]
+        main_logits = self.lm_head(main_h)
+
+        main_loss, metrics = self.inner_loss(
+            main_logits, labels, global_valid_tokens, **loss_inputs
+        )
+
+        aux = mtp_auxiliary_loss(
+            pred,
+            labels,
+            mtp_config=self.mtp_config,
+            lm_head=self.lm_head,
+            loss_mask=loss_inputs.get("loss_mask"),
+        )
+        return main_loss + aux, metrics
+
+
 class _DecoderOutputGradientBackProp(torch.autograd.Function):
     """Bridges chunked lm_head backward with decoder backward via autograd.
 

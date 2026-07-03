@@ -28,6 +28,7 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.mtp import MTPBlock, MTPConfig
 from torchtitan.models.common.nn_modules import Linear, RMSNorm
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
@@ -82,6 +83,11 @@ class Decoder(BaseModel):
         # that support it set this True in their config factories; the tying
         # itself is handled by ``Decoder.__init__`` / ``Decoder.init_states``.
         enable_weight_tying: bool = False
+
+        # Multi-Token Prediction (DeepSeek-V3 style).  When set, the forward
+        # pass produces ``[B, (mtp.num_layers + 1) * L, dim]`` hidden states
+        # (concatenated main + per-depth outputs) for the loss function.
+        mtp: MTPConfig | None = None
 
         @property
         def first_attention(self) -> BaseAttention.Config | None:
@@ -243,6 +249,21 @@ class Decoder(BaseModel):
         if self.enable_weight_tying:
             self.tok_embeddings.weight = self.lm_head.weight
 
+        mtp_cfg = config.mtp
+        if mtp_cfg is not None and mtp_cfg.num_layers > 0:
+            inner_cfg = (
+                mtp_cfg.inner_block_config
+                if mtp_cfg.inner_block_config is not None
+                else config.layers[-1]
+            )
+            self.mtp_block = MTPBlock(
+                mtp_config=mtp_cfg,
+                dim=config.dim,
+                inner_block_config=inner_cfg,
+            )
+        else:
+            self.mtp_block = None
+
     def init_states(
         self,
         *,
@@ -274,6 +295,13 @@ class Decoder(BaseModel):
             h = layer(h, attention_masks, positions)
 
         h = self.norm(h) if self.norm is not None else h
+
+        # MTP extends hidden_states with multi-token prediction depths.
+        # Produces [B, (D+1)*L, dim] where D = mtp_config.num_layers.
+        if self.mtp_block is not None and self.mtp_block.num_depths > 0:
+            h = self.mtp_block(
+                tokens, h, positions, attention_masks, self.tok_embeddings
+            )
 
         # _skip_lm_head is an attribute rather than a forward kwarg because PP backward
         # calls .requires_grad on all stage inputs, which fails on bool kwargs.
