@@ -71,6 +71,28 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
                 }
             )
 
+        # Adjustments for from_hf_map to include indexer mappings
+        if model_config.use_sparse_attn:
+            self.from_hf_map.update(
+                {
+                    "model.layers.{}.self_attn.indexer.wq_b.weight": (
+                        "layers.{}.attention.indexer.wq_b.weight"
+                    ),
+                    "model.layers.{}.self_attn.indexer.wk.weight": (
+                        "layers.{}.attention.indexer.wk.weight"
+                    ),
+                    "model.layers.{}.self_attn.indexer.k_norm.weight": (
+                        "layers.{}.attention.indexer.k_norm.weight"
+                    ),
+                    "model.layers.{}.self_attn.indexer.k_norm.bias": (
+                        "layers.{}.attention.indexer.k_norm.bias"
+                    ),
+                    "model.layers.{}.self_attn.indexer.weights_proj.weight": (
+                        "layers.{}.attention.indexer.weights_proj.weight"
+                    ),
+                }
+            )
+
     def get_hf_storage_reader(
         self, path: str, from_quantized: bool = False
     ) -> HuggingFaceStorageReader:

@@ -21,7 +21,7 @@ from torchtitan.models.common.decoder_sharding import (
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.deepseek_v3.model import Attention
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 if TYPE_CHECKING:
     from torchtitan.models.deepseek_v3.model import (
@@ -140,4 +140,74 @@ def _set_deepseek_v3_layer_sharding(
             enable_ep=enable_ep,
             enable_sp=enable_sp,
             expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
+        )
+
+
+def set_deepseek_v3_indexer_sharding_config(
+    config: "DeepSeekV3Model.Config",
+) -> None:
+    for layer_cfg in config.layers:
+        indexer_cfg = layer_cfg.attention.indexer
+        if indexer_cfg is None:
+            continue
+        indexer_cfg.wq_b.sharding_config = ShardingConfig(
+            state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
+        )
+        indexer_cfg.weights_proj.sharding_config = ShardingConfig(
+            state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
+        )
+        indexer_cfg.wk.sharding_config = ShardingConfig(
+            state_shardings={"weight": dense_param_placement(tp=spmd.R)},
+        )
+        indexer_cfg.k_norm.sharding_config = ShardingConfig(
+            state_shardings={
+                "weight": dense_param_placement(tp=spmd.R),
+                "bias": dense_param_placement(tp=spmd.R),
+            },
+        )
+        indexer_cfg.rope.sharding_config = ShardingConfig(
+            state_shardings={"cache": dense_param_placement(tp=spmd.R)},
+        )
+
+        inner_cfg = layer_cfg.attention.inner_attention
+        inner_cfg.sharding_config = ShardingConfig(
+            in_src_shardings={
+                "q_BLNH": dense_activation_placement(tp=spmd.S(2)),
+                "k_BLNH": dense_activation_placement(tp=spmd.S(2)),
+                "v_BLNH": dense_activation_placement(tp=spmd.S(2)),
+                "idx_q_BLNH": dense_activation_placement(tp=spmd.S(2)),
+                "idx_k_BLH": dense_activation_placement(tp=spmd.R),
+                "idx_w_BLN": dense_activation_placement(tp=spmd.S(2)),
+            },
+            in_dst_shardings={
+                "q_BLNH": dense_activation_placement(tp=spmd.S(2)),
+                "k_BLNH": dense_activation_placement(tp=spmd.S(2), cp=spmd.R),
+                "v_BLNH": dense_activation_placement(tp=spmd.S(2), cp=spmd.R),
+                "idx_q_BLNH": dense_activation_placement(tp=spmd.R),
+                "idx_k_BLH": dense_activation_placement(tp=spmd.R, cp=spmd.R),
+                "idx_w_BLN": dense_activation_placement(tp=spmd.R),
+            },
+            out_src_shardings=dense_activation_placement(tp=spmd.S(2)),
+            local_map=LocalMapConfig(
+                in_grad_placements=(
+                    dense_activation_placement(tp=spmd.S(2)),
+                    dense_activation_placement(tp=spmd.S(2), cp=spmd.P),
+                    dense_activation_placement(tp=spmd.S(2), cp=spmd.P),
+                    None,
+                    None,
+                    None,
+                ),
+            ),
+        )
+
+        indexer_loss_cfg = layer_cfg.attention.inner_attention.indexer_loss
+        indexer_loss_cfg.sharding_config = ShardingConfig(
+            in_src_shardings={
+                "q": dense_activation_placement(tp=spmd.S(2)),
+                "k": dense_activation_placement(tp=spmd.S(2)),
+            },
+            in_dst_shardings={
+                "q": dense_activation_placement(tp=spmd.R),
+                "k": dense_activation_placement(tp=spmd.R),
+            },
         )

@@ -15,7 +15,9 @@ from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
     ComplexRoPE,
+    CosSinRoPE,
     Embedding,
+    LayerNorm,
     Linear,
     RMSNorm,
     RoPE,
@@ -33,7 +35,13 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import Attention, DeepSeekV3Model, DeepSeekV3TransformerBlock
+from .model import (
+    Attention,
+    DeepSeekV3Model,
+    DeepSeekV3TransformerBlock,
+    DeepSeekSparseAttention,
+    Indexer,
+)
 from .parallelize import parallelize_deepseekv3
 from .state_dict_adapter import DeepSeekV3StateDictAdapter
 
@@ -88,14 +96,50 @@ def _make_dsv3_attn_config(
     mscale: float = 1.0,
     attn_backend: str,
     rope: RoPE.Config,
+    index_n_heads: int | None = None,
+    index_head_dim: int | None = None,
+    index_topk: int | None = None,
 ) -> Attention.Config:
     """Build a fully-specified DeepSeek V3 MLA Attention.Config.
 
     All Linear and RMSNorm sub-configs have their dimensional fields set.
     When q_lora_rank == 0, sets wq (not wq_a/wq_b).
     When q_lora_rank > 0, sets wq_a/wq_b (not wq).
+    When index_* kwargs are provided, also builds the Lightning Indexer
+    sub-modules and wraps the inner attention with DeepSeekSparseAttention.
     """
     inner_attention = get_attention_config(attn_backend)
+    indexer = None
+    if index_n_heads is not None:
+        assert index_head_dim is not None and index_topk is not None
+        indexer = Indexer.Config(
+            dim=dim, q_lora_rank=q_lora_rank,
+            index_n_heads=index_n_heads, index_head_dim=index_head_dim,
+            rope_head_dim=qk_rope_head_dim, index_topk=index_topk,
+            wq_b=Linear.Config(
+                in_features=q_lora_rank,
+                out_features=index_n_heads * index_head_dim,
+                param_init=_LINEAR_INIT,
+            ),
+            wk=Linear.Config(
+                in_features=dim, out_features=index_head_dim,
+                param_init=_LINEAR_INIT,
+            ),
+            k_norm=LayerNorm.Config(normalized_shape=index_head_dim),
+            weights_proj=Linear.Config(
+                in_features=dim, out_features=index_n_heads,
+                param_init={"weight": partial(nn.init.normal_, std=1.0)},
+            ),
+            rope=CosSinRoPE.Config(
+                dim=qk_rope_head_dim, max_seq_len=rope.max_seq_len,
+                theta=rope.theta, scaling=rope.scaling,
+                rope_factor=rope.rope_factor,
+                beta_fast=rope.beta_fast, beta_slow=rope.beta_slow,
+                original_seq_len=rope.original_seq_len,
+            ),
+        )
+        inner_attention = DeepSeekSparseAttention.Config(index_topk=index_topk)
+
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
     if q_lora_rank == 0:
@@ -154,6 +198,7 @@ def _make_dsv3_attn_config(
         ),
         inner_attention=inner_attention,
         rope=dataclasses.replace(rope),
+        indexer=indexer,
     )
 
 
@@ -184,6 +229,9 @@ def _build_dsv3_layers(
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None,
     rope: RoPE.Config,
+    index_n_heads: int | None = None,
+    index_head_dim: int | None = None,
+    index_topk: int | None = None,
 ) -> list[TransformerBlock.Config]:
     """Build the list of per-layer TransformerBlock configs.
 
@@ -207,6 +255,9 @@ def _build_dsv3_layers(
             mscale=mscale,
             attn_backend=attn_backend,
             rope=rope,
+            index_n_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            index_topk=index_topk,
         )
 
         if layer_id < n_dense_layers:

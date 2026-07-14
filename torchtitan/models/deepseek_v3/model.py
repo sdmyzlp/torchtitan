@@ -4,12 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 import math
 from dataclasses import dataclass, field
 
 import spmd_types as spmd
 import torch
+import torch.nn.functional as F
 from torch import nn
+
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    create_mask,
+)
 
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.attention import (
@@ -17,11 +25,225 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     FlexAttention,
 )
+from torchtitan.models.common.aux_loss import LoggedAuxLoss
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.common.nn_modules import Linear, RMSNorm
+from torchtitan.models.common.nn_modules import LayerNorm, Linear, RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
+
+
+@functools.cache
+def _hadamard(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    assert dim & (dim - 1) == 0, "Hadamard dim must be a power of two"
+    H = torch.ones((1, 1), dtype=dtype, device=device)
+    while H.shape[0] < dim:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    return H
+
+
+class Indexer(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        dim: int
+        q_lora_rank: int
+        index_n_heads: int
+        index_head_dim: int
+        rope_head_dim: int
+        index_topk: int
+        wq_b: Linear.Config
+        wk: Linear.Config
+        k_norm: LayerNorm.Config
+        weights_proj: Linear.Config
+        rope: RoPE.Config
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.rope_head_dim
+        self.index_topk = config.index_topk
+
+        self.wq_b = config.wq_b.build()
+        self.wk = config.wk.build()
+        self.k_norm = config.k_norm.build()
+        self.weights_proj = config.weights_proj.build()
+        self.rope = config.rope.build()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ):
+        bsz, seqlen, _ = x.size()
+
+        q = self.wq_b(qr)
+        with spmd.local():
+            q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
+            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+                spmd.assert_type(
+                    q,
+                    {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+                )
+        q_pe, q_nope = torch.split(
+            q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        k = self.k_norm(self.wk(x))
+        k_pe, k_nope = torch.split(
+            k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(2), positions)
+        idx_q = Indexer._hadamard_rotate(torch.cat([q_pe, q_nope], dim=-1))
+        idx_k = Indexer._hadamard_rotate(torch.cat([k_pe.squeeze(2), k_nope], dim=-1))
+
+        idx_w = self.weights_proj(x) * (self.n_heads**-0.5)
+        idx_w = idx_w * (self.head_dim**-0.5)
+
+        return idx_q, idx_w, idx_k
+
+    @staticmethod
+    def select(
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_w: torch.Tensor,
+        block_mask: BlockMask,
+        index_topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, Lq, _, _ = idx_q.shape
+        Lkv = idx_k.shape[1]
+
+        scores = torch.relu(
+            torch.einsum("blhd,bsd->blhs", idx_q.float(), idx_k.float())
+        )
+        index_scores = (scores * idx_w.unsqueeze(-1).float()).sum(dim=2)
+
+        valid = create_mask(
+            block_mask.mask_mod, B, 1, Lq, Lkv, device=idx_q.device
+        ).squeeze(1)
+        index_scores = index_scores.masked_fill(~valid, float("-inf"))
+
+        k = min(index_topk, Lkv)
+        topk_scores, topk_indices = index_scores.topk(k, dim=-1)
+        return topk_indices.where(topk_scores.isfinite(), -1), index_scores
+
+    @staticmethod
+    def _hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+        d = x.size(-1)
+        H = _hadamard(d, device=x.device, dtype=x.dtype)
+        return F.linear(x.reshape(-1, d), H).reshape(x.shape) * (d ** -0.5)
+
+
+class DSAIndexerAuxLoss(LoggedAuxLoss):
+    """Indexer alignment loss for the sparse training stage (DSA paper eq. 4).
+
+    Follows the paper and Megatron-LM's reference implementation:
+      1. Per-head attention scores: softmax over keys, restricted to S_t.
+      2. Aggregate across heads: sum then L1-normalize → target p.
+      3. Indexer distribution: softmax over index scores → q.
+      4. KL(p || q) summed over query tokens; gradient flows only to
+         the indexer (q/k are detached from the main model's graph).
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(LoggedAuxLoss.Config):
+        coeff: float = 1.0
+        tag: str = "dsa_indexer_loss"
+        reduce_mesh: str = "loss"
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        scale: float | None,
+        selected: torch.Tensor,
+        index_scores: torch.Tensor,
+        *,
+        carrier: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = torch.einsum("blnh,bsnh->blns", q.float(), k.float())
+        if scale is not None:
+            logits = logits * scale
+
+        logits = logits.masked_fill(~selected.unsqueeze(2), float("-inf"))
+        p = F.softmax(logits, dim=-1).mean(dim=2)
+
+        scores = index_scores.masked_fill(~selected, float("-inf"))
+        q = F.softmax(scores, dim=-1)
+
+        eps = 1e-10
+        kl_loss = (p * ((p + eps).log() - (q + eps).log())).sum(dim=-1).mean()
+        return self.inject(carrier, kl_loss)
+
+
+class DeepSeekSparseAttention(FlexAttention):
+    @dataclass(kw_only=True, slots=True)
+    class Config(FlexAttention.Config):
+        index_topk: int
+        indexer_loss: DSAIndexerAuxLoss.Config = field(
+            default_factory=DSAIndexerAuxLoss.Config
+        )
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.index_topk = config.index_topk
+        self.indexer_loss = config.indexer_loss.build()
+
+    def forward(
+        self,
+        q_BLNH: torch.Tensor,
+        k_BLNH: torch.Tensor,
+        v_BLNH: torch.Tensor,
+        idx_q_BLNH: torch.Tensor,
+        idx_k_BLH: torch.Tensor,
+        idx_w_BLN: torch.Tensor,
+        *,
+        attention_masks: BlockMask,
+        scale: float | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        topk_indices, index_scores = Indexer.select(
+            idx_q_BLNH, idx_k_BLH, idx_w_BLN,
+            attention_masks, self.index_topk,
+        )
+
+        def _build_selected(
+            topk_indices: torch.Tensor,
+        ) -> tuple[torch.Tensor, BlockMask]:
+            B, Lq = q_BLNH.shape[:2]
+            Lkv = k_BLNH.shape[1]
+
+            mask = torch.zeros(
+                B, Lq, Lkv, dtype=torch.bool, device=topk_indices.device
+            ).scatter_add_(-1, topk_indices.clamp(min=0), topk_indices != -1)
+
+            with spmd.no_typecheck():
+                block_mask = create_block_mask(
+                    lambda b, h, q_idx, k_idx: mask[b, q_idx, k_idx],
+                    B=B, H=None,
+                    Q_LEN=Lq, KV_LEN=Lkv,
+                    device=topk_indices.device,
+                    BLOCK_SIZE=attention_masks.BLOCK_SIZE,
+                    _compile=True,
+                )
+            return mask, block_mask
+
+        selected, selected_bm = _build_selected(topk_indices)
+
+        output = super().forward(
+            q_BLNH, k_BLNH, v_BLNH,
+            attention_masks=selected_bm,
+            scale=scale,
+        )
+        if self.training:
+            output = self.indexer_loss(
+                q_BLNH.detach(), k_BLNH.detach(),
+                scale, selected, index_scores, carrier=output,
+            )
+        return output
 
 
 class Attention(BaseAttention):
@@ -51,6 +273,13 @@ class Attention(BaseAttention):
         rope: RoPE.Config
         inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
         mscale: float = 1.0
+        indexer: Indexer.Config | None = None
+
+        def __post_init__(self):
+            if self.q_lora_rank == 0:
+                assert self.indexer is None, (
+                    "indexer requires q_lora_rank > 0"
+                )
 
     def __init__(self, config: Config):
         super().__init__()
@@ -88,6 +317,8 @@ class Attention(BaseAttention):
 
         self.inner_attention = config.inner_attention.build()
         self.rope = config.rope.build()
+        if config.indexer is not None:
+            self.indexer = config.indexer.build()
 
     def forward(
         self,
@@ -102,7 +333,8 @@ class Attention(BaseAttention):
             q = self.wq(x)
         else:
             q = self.wq_a(x)
-            q = self.wq_b(self.q_norm(q))
+            qr = self.q_norm(q)
+            q = self.wq_b(qr)
 
         # TODO(pianpwk): same QKV:S(2) unflatten case handled by even sharding
         with spmd.local():
@@ -139,10 +371,37 @@ class Attention(BaseAttention):
                         {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
                     )
 
-        output = self.inner_attention(
-            q, k, v, attention_masks=attention_masks, scale=self.softmax_scale
-        ).contiguous()
-        output = output.view(bsz, seqlen, -1)
+        if self.indexer is not None:
+            idx_q, idx_w, idx_k = self.indexer(
+                x.detach(), qr.detach(), positions=positions
+            )
+            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+                spmd.assert_type(
+                    idx_q,
+                    {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+                )
+                spmd.assert_type(
+                    idx_w,
+                    {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+                )
+                spmd.assert_type(
+                    idx_k,
+                    {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R},
+                )
+
+            output = self.inner_attention(
+                q, k, v,
+                idx_q, idx_k, idx_w,
+                attention_masks=attention_masks,
+                scale=self.softmax_scale,
+            )
+        else:
+            output = self.inner_attention(
+                q, k, v,
+                attention_masks=attention_masks,
+                scale=self.softmax_scale,
+            )
+        output = output.contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
 
@@ -204,12 +463,22 @@ class DeepSeekV3Model(Decoder):
 
             from torchtitan.models.deepseek_v3.sharding import (
                 set_deepseek_v3_sharding_config,
+                set_deepseek_v3_indexer_sharding_config,
             )
 
             set_deepseek_v3_sharding_config(
                 self,
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
+            )
+            if self.use_sparse_attn:
+                set_deepseek_v3_indexer_sharding_config(self)
+
+        @property
+        def use_sparse_attn(self) -> bool:
+            return any(
+                layer.attention.indexer is not None
+                for layer in self.layers
             )
 
         def get_nparams_and_flops(
