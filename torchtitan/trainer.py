@@ -658,6 +658,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # tests) still receives positions for RoPE but no masks — it relies on
         # is_causal instead.
         if isinstance(self.model_config, Decoder.Config) and positions is not None:
+            handler = self.model_config.mask_handler.build()
+
             inner_attention = getattr(
                 self.model_config.first_attention, "inner_attention", None
             )
@@ -669,15 +671,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     positions=positions,
                 )
 
-        if self.parallel_dims.cp_enabled:
-            inputs, labels, extra_kwargs = prepare_context_parallel_input(
-                inputs,
-                labels,
-                extra_kwargs,
-                self.parallel_dims.get_mesh("cp"),
-                self.device,
-                self.config.parallelism.context_parallel_load_balancer,
-            )
+            masks = extra_kwargs.get("attention_masks")
+            if self.parallel_dims.cp_enabled:
+                inputs, labels, extra_kwargs = prepare_context_parallel_input(
+                    inputs,
+                    labels,
+                    extra_kwargs,
+                    self.parallel_dims.get_mesh("cp"),
+                    self.device,
+                    self.config.parallelism.context_parallel_load_balancer,
+                    mask_handler=handler,
+                )
+
+            masks = extra_kwargs.get("attention_masks")
+            if masks is not None:
+                extra_kwargs["attention_masks"] = handler.post_process(
+                    masks, extra_kwargs.get("positions", positions),
+                )
 
         # Accumulate after CP sharding so labels.numel() reflects the actual
         # unique tokens this rank processes (not the full pre-split sequence).

@@ -23,6 +23,7 @@ from torch.distributed.tensor.experimental._context_parallel._attention import (
 )
 from torch.nn.attention.flex_attention import BlockMask
 
+from torchtitan.distributed.mask_handler import MaskHandler
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     FlexAttention,
@@ -118,6 +119,7 @@ def prepare_context_parallel_input(
     cp_mesh: DeviceMesh,
     device: torch.device,
     load_balancer_type: str | None = "headtail",
+    mask_handler: MaskHandler | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """
     Shard inputs, labels, positions, and attention masks for Context Parallel.
@@ -135,6 +137,8 @@ def prepare_context_parallel_input(
         device: Device for the tensors
         load_balancer_type: Type of load balancer to use for sharding.
             Options: "headtail", "ptrr", or None. Defaults to "headtail".
+        mask_handler: Handler for CP mask sharding. Required when
+            attention_masks is not None.
 
     Returns:
         Tuple of (sharded_inputs, sharded_labels, updated_extra_kwargs) where:
@@ -150,6 +154,7 @@ def prepare_context_parallel_input(
         (inputs, labels, positions),
         attention_masks,
         load_balancer_type,
+        mask_handler=mask_handler,
     )
     extra_kwargs["positions"] = positions
     if attention_masks is not None:
@@ -164,6 +169,7 @@ def cp_shard(
     attention_masks: AttentionMasksType | None,
     load_balancer_type: str | None = "headtail",
     input_seq_dim: int = 1,
+    mask_handler: MaskHandler | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | None]:
     """
     Shard inputs and attention masks across the context parallel mesh.
@@ -172,12 +178,14 @@ def cp_shard(
     along the sequence dimension, enabling efficient processing. It optionally
     uses a load balancer to handle uneven computation workload.
 
+    Mask sharding is delegated to ``mask_handler`` when ``attention_masks``
+    is not None.
+
     Args:
         cp_mesh: Device mesh for context parallel dimension
         inputs: Tuple of input tensors to be sharded along the sequence
             dimension
-        attention_masks: Attention masks to be sharded. Supports None,
-            BlockMask, or dict[str, BlockMask]
+        attention_masks: Attention masks to be sharded.
         load_balancer_type: Type of load balancer to use. Options:
             - "headtail": Use HeadTailLoadBalancer (for SDPA)
             - "ptrr": Use PTRRLoadBalancer (for FlexAttention)
@@ -185,16 +193,15 @@ def cp_shard(
             Defaults to "headtail".
         input_seq_dim: Sequence dimension index for sharding. Defaults to 1,
             which covers most use cases where tensors have shape
-            [batch_size, seq_len]. Can be changed by passing a
-            different value if your tensors use a different sequence
-            dimension layout.
+            [batch_size, seq_len].
+        mask_handler: Handler for CP mask sharding. Required when
+            attention_masks is not None.
 
     Returns:
         Tuple of (sharded_inputs, attention_masks) where:
             - sharded_inputs: Tuple of input tensors sharded along the
               sequence dimension
-            - attention_masks: Sharded attention masks (BlockMask or
-              dict[str, BlockMask]) or None
+            - attention_masks: Sharded attention masks or None
 
     Raises:
         ValueError: If load_balancer_type is "ptrr" and attention_masks
@@ -207,15 +214,10 @@ def cp_shard(
     if load_balancer_type:
         match load_balancer_type:
             case "headtail":
-                # For SDPA, we use the _HeadTailLoadBalancer.
                 load_balancer = _HeadTailLoadBalancer(
                     seq_len, cp_world_size, cp_mesh.device_type
                 )
             case "ptrr":
-                # For FlexAttention, we use _PTRRLoadBalancer.
-                # _PTRRLoadBalancer requires attention_masks to be a BlockMask.
-                # For dict[str, BlockMask], _PTRRLoadBalancer currently doesn't
-                # support the case where there are multiple masks.
                 if attention_masks is None or isinstance(attention_masks, dict):
                     raise ValueError(
                         "PTRRLoadBalancer requires attention_masks to be a "
@@ -243,29 +245,14 @@ def cp_shard(
         ),
     )
 
-    # BlockMask, has shape, [B, H, Q, KV], and we can only shard
-    # on the Q seq dimension, not KV.
-    MASK_Q_SEQ_DIM = 2
     if attention_masks is not None:
-        assert isinstance(attention_masks, (BlockMask, dict))
-        masks = (
-            [attention_masks]
-            if isinstance(attention_masks, BlockMask)
-            else list(attention_masks.values())
+        assert mask_handler is not None, (
+            "cp_shard requires mask_handler when attention_masks is not None"
         )
-        masks = _context_parallel_shard(
-            mesh=cp_mesh,
-            buffers=masks,
-            seq_dims=(MASK_Q_SEQ_DIM,) * len(masks),
-            load_balancer=load_balancer,
-        )
-        attention_masks = cast(
-            (BlockMask | dict[str, BlockMask]),
-            (
-                masks[0]
-                if isinstance(attention_masks, BlockMask)
-                else {k: v for k, v in zip(attention_masks.keys(), masks)}
-            ),
+        attention_masks = mask_handler.shard(
+            attention_masks,
+            cp_mesh,
+            load_balancer,
         )
 
     return inputs, attention_masks

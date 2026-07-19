@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 from torch.nn.attention.flex_attention import _mask_mod_signature, and_masks, BlockMask
 
+from torchtitan.distributed.mask_handler import BlockMaskHandler, MaskHandler
 from torchtitan.distributed.minimal_async_ep.api import (
     maybe_update_minimal_async_ep_config,
 )
@@ -85,6 +86,11 @@ class Decoder(BaseModel):
         # that support it set this True in their config factories; the tying
         # itself is handled by ``Decoder.__init__`` / ``Decoder.init_states``.
         enable_weight_tying: bool = False
+
+        # Handler for CP mask sharding. ``BlockMaskHandler`` is the default;
+        mask_handler: MaskHandler.Config = field(
+            default_factory=BlockMaskHandler.Config
+        )
 
         @property
         def first_attention(self) -> BaseAttention.Config | None:
