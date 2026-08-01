@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -61,62 +62,35 @@ def dense_token_ids_sequence_parallel_placement() -> SpmdLayout:
 def set_dsa_flex_attention_sharding(inner_attention_cfg) -> None:
     query_states = dense_activation_placement(tp=spmd.S(2))
     replicated_activation = dense_activation_placement(tp=spmd.R)
+    partial_activation = dense_activation_placement(tp=spmd.P)
 
     input_shardings = {
-        "query_states": query_states,
-        "kv_states": replicated_activation,
+        "q": query_states,
+        "swa_k": replicated_activation,
+        "cmp_k": replicated_activation,
+        "idx_q": replicated_activation,
+        "idx_k": replicated_activation,
+        "idx_w": replicated_activation,
         "attn_sink": _attn_sink_placement,
-        "topk_idxs": replicated_activation,
     }
+    # in_grad_placements aligns with the positional args only; idx_* carry no
+    # gradient because Attention.forward feeds them detached.
     grad_placements = [
         query_states,
-        dense_activation_placement(tp=spmd.P),
-        _attn_sink_placement,
+        partial_activation,
+        partial_activation,
         None,
+        None,
+        None,
+        _attn_sink_placement,
     ]
-
-    returns_lse = getattr(inner_attention_cfg, "return_lse", False)
-    out_src_shardings = (query_states, query_states) if returns_lse else query_states
-    out_dst_shardings = None if returns_lse else query_states
 
     inner_attention_cfg.sharding_config = ShardingConfig(
         in_src_shardings=input_shardings,
         in_dst_shardings=dict(input_shardings),
-        out_src_shardings=out_src_shardings,
-        out_dst_shardings=out_dst_shardings,
-        local_map=LocalMapConfig(in_grad_placements=tuple(grad_placements)),
-    )
-
-
-def set_dsa_indexer_aux_loss_sharding(indexer_aux_loss_cfg) -> None:
-    query_states = dense_activation_placement(tp=spmd.S(2))
-    replicated_activation = dense_activation_placement(tp=spmd.R)
-    partial_activation = dense_activation_placement(tp=spmd.P)
-
-    input_shardings = {
-        "carrier": query_states,
-        "q": query_states,
-        "kv_compress": replicated_activation,
-        "compress_topk_idxs": replicated_activation,
-        "index_score": replicated_activation,
-        "attn_lse": query_states,
-    }
-
-    indexer_aux_loss_cfg.sharding_config = ShardingConfig(
-        in_src_shardings=input_shardings,
-        in_dst_shardings=dict(input_shardings),
         out_src_shardings=query_states,
         out_dst_shardings=query_states,
-        local_map=LocalMapConfig(
-            in_grad_placements=(
-                query_states,
-                query_states,
-                replicated_activation,
-                None,
-                partial_activation,
-                query_states,
-            )
-        ),
+        local_map=LocalMapConfig(in_grad_placements=tuple(grad_placements)),
     )
 
 
@@ -165,8 +139,6 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
         set_compressor_sharding(at.compressor_128)
     if at.indexer is not None:
         set_indexer_sharding(at.indexer)
-    if at.indexer_aux_loss is not None:
-        set_dsa_indexer_aux_loss_sharding(at.indexer_aux_loss)
 
 
 def set_compressor_sharding(compressor_cfg):
@@ -254,12 +226,12 @@ def set_deepseek_v4_layer_sharding(
             if enable_ep
             else dense_activation_placement(tp=spmd.R)
         )
-        layer_cfg.moe.sharding_config.in_src_shardings["input_ids"] = (
-            input_ids_src_placement
-        )
-        layer_cfg.moe.sharding_config.in_dst_shardings["input_ids"] = (
-            input_ids_dst_placement
-        )
+        layer_cfg.moe.sharding_config.in_src_shardings[
+            "input_ids"
+        ] = input_ids_src_placement
+        layer_cfg.moe.sharding_config.in_dst_shardings[
+            "input_ids"
+        ] = input_ids_dst_placement
         router_sharding = layer_cfg.moe.router.sharding_config or ShardingConfig()
         router_sharding.state_shardings["tid2eid"] = _replicated_layout
         layer_cfg.moe.router.sharding_config = router_sharding

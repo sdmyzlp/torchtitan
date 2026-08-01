@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -48,9 +49,7 @@ class Compressor(Module):
         self.wkv = cfg.wkv.build()
         self.wgate = cfg.wgate.build()
         self.norm = cfg.norm.build()
-        self.ape = nn.Parameter(
-            torch.empty(cfg.compress_ratio, self.wkv.out_features)
-        )
+        self.ape = nn.Parameter(torch.empty(cfg.compress_ratio, self.wkv.out_features))
 
     def _overlap_transform(self, tensor, value=0):
         ratio, d = self.compress_ratio, self.head_dim
@@ -99,9 +98,7 @@ class Indexer(Module):
         compressor: "Compressor.Config"
         num_index_heads: int = 64
         index_head_dim: int = 128
-        index_topk: int = 512
         rope_head_dim: int = 64
-        compress_ratio: int = 4
 
     def __init__(self, config: Config):
         super().__init__()
@@ -109,9 +106,7 @@ class Indexer(Module):
         self.num_index_heads = cfg.num_index_heads
         self.head_dim = cfg.index_head_dim
         self.rope_head_dim = cfg.rope_head_dim
-        self.index_topk = cfg.index_topk
         self.softmax_scale = cfg.index_head_dim**-0.5
-        self.compress_ratio = cfg.compress_ratio
         self.rope = cfg.rope.build()
 
         self.wq_b = cfg.wq_b.build()
@@ -130,8 +125,16 @@ class Indexer(Module):
         qr,
         *,
         positions,
-        offset: int,
     ):
+        """Project raw indexer queries, keys, and per-head weights.
+
+        Returns:
+            idx_q: Indexer queries ``[B, L, num_index_heads, index_head_dim]``
+                with RoPE applied and Hadamard-rotated.
+            idx_k: Indexer compressed keys ``[B, L // ratio, index_head_dim]``
+                (from the indexer's own compressor), Hadamard-rotated.
+            idx_w: Per-head indexer weights ``[B, L, num_index_heads]``.
+        """
         bsz, seqlen, _ = x.size()
         rd = self.rope_head_dim
         q = self.wq_b(qr)
@@ -142,25 +145,42 @@ class Indexer(Module):
         q = self._rotate_activation(q)
         k = self.compressor(x, positions=positions)
         k = self._rotate_activation(k)
-        weights = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
-        index_score = torch.einsum("bshd,btd->bsht", q, k)
-        index_score = index_score.relu_() * weights.unsqueeze(-1)
+        weights = self.weights_proj(x) * (
+            self.softmax_scale * self.num_index_heads**-0.5
+        )
+        return q, k, weights
+
+    @staticmethod
+    def select(
+        idx_q,
+        idx_k,
+        idx_w,
+        *,
+        seqlen: int,
+        ratio: int,
+        topk: int,
+    ) -> torch.Tensor:
+        """Select the top-k compressed positions per query from indexer scores.
+
+        Returns ``topk_indices`` of shape ``[B, L, K]``, ``K = min(topk,
+        seqlen // ratio)``, with 0-based indices into the compressed region
+        (compressed token ``c`` lives at KV position ``seqlen + c``).
+        Non-causal positions are excluded by the causal score mask before the
+        ``topk``, so all returned indices are attendable.
+        """
+        index_score = torch.einsum("bshd,btd->bsht", idx_q, idx_k)
+        index_score = index_score.relu_() * idx_w.unsqueeze(-1)
         index_score = index_score.sum(dim=2)
 
-        ratio = self.compress_ratio
         compress_causal_limit = (
-            torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
+            torch.arange(1, seqlen + 1, device=idx_q.device).unsqueeze(1) // ratio
         )
         compress_causal_mask = (
-            torch.arange(seqlen // ratio, device=x.device).repeat(seqlen, 1)
+            torch.arange(seqlen // ratio, device=idx_q.device).repeat(seqlen, 1)
             >= compress_causal_limit
         )
         index_score = index_score + torch.where(
-            compress_causal_mask, torch.finfo(q.dtype).min, 0
+            compress_causal_mask, torch.finfo(idx_q.dtype).min, 0
         )
-        index_score, topk_idxs = index_score.topk(
-            min(self.index_topk, seqlen // ratio), dim=-1
-        )
-        mask = topk_idxs >= compress_causal_limit
-        compress_topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-        return compress_topk_idxs, index_score
+        _, topk_indices = index_score.topk(min(topk, seqlen // ratio), dim=-1)
+        return topk_indices
