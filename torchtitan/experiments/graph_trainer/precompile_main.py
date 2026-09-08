@@ -125,6 +125,21 @@ def _common_setup(config):
     # TODO: Factor the model setup below with the training path so precompile
     # and training share a single implementation of build/parallelize/init.
     model_config = model_spec.model
+    # Match the trainer's token-budget resolution: Decoder.update_from_config
+    # fills the aux-loss normalization denominator, and the traced forward
+    # must see the same value a training run would.
+    num_pp_microbatches = (
+        config.parallelism.num_pp_microbatches if parallel_dims.pp_enabled else 1
+    )
+    num_tokens_per_grad_step = (
+        config.training.num_tokens_per_microbatch_per_dp_rank
+        * num_pp_microbatches
+        * (parallel_dims.dp_replicate * parallel_dims.dp_shard)
+    )
+    num_tokens_per_train_step = config.training.num_tokens_per_train_step
+    if num_tokens_per_train_step < 0:
+        num_tokens_per_train_step = num_tokens_per_grad_step
+    config.training.num_tokens_per_train_step = num_tokens_per_train_step
     model_config.update_from_config(config=config)
 
     logger.info(f"Building {model_spec.name} {model_spec.flavor} on meta device")
