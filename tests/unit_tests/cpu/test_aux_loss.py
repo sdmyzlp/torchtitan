@@ -55,8 +55,11 @@ def _reference_seqwise_aux_loss(
 ) -> torch.Tensor:
     """Explicit DeepSeek-V3 per-forward aux loss (Eqs 17-20), framework-scaled.
 
-    ``T`` is the number of tokens in the forward (the whole input, matching
-    the single-process shape-derived count).
+    Eqs 17-20 define a per-token-normalized value; the loss uses the
+    token-mode (sum-type) form, i.e. ``T`` times that value, so that the
+    framework's ``1 / per_step_denominator`` scaling lands on the per-token
+    scale.  ``T`` is the number of tokens in the forward (the whole input,
+    matching the single-process shape-derived count).
     """
     E = scores_TE.size(-1)
     T = scores_TE.size(0)
@@ -68,7 +71,7 @@ def _reference_seqwise_aux_loss(
     prob_sums_E = probs_TE.sum(dim=0)
     f_E = counts_E * (E / (top_k * T))
     p_E = prob_sums_E / T
-    return (f_E * p_E).sum() * (coeff / per_step_denominator)
+    return (f_E * p_E).sum() * T * (coeff / per_step_denominator)
 
 
 def _make_loss_module(
@@ -310,7 +313,8 @@ class TestSeqwiseLossSpmdTypes(DTensorTestBase):
             num_tokens = scores.shape[0]
             f_E = counts_E * (E / (top_k * num_tokens))
             p_E = prob_sums_E / num_tokens
-            ref_loss = (f_E * p_E).sum()
+            # Token-mode (sum-type) form: T times the Eqs 17-20 value.
+            ref_loss = (f_E * p_E).sum() * num_tokens
         ref_scores = scores.detach().clone().requires_grad_(True)
         rm = torch.zeros(scores.shape[0], E).scatter_(-1, ids, 1.0)
         cts = rm.sum(dim=0)
@@ -318,7 +322,7 @@ class TestSeqwiseLossSpmdTypes(DTensorTestBase):
         nt = scores.shape[0]
         f = cts * (E / (top_k * nt))
         p = prs.sum(dim=0) / nt
-        ref_aux = (f * p).sum() * coeff
+        ref_aux = (f * p).sum() * nt * coeff
         ref_carrier = ref_scores.gather(dim=-1, index=ids)
         (ref_aux + ref_carrier.sum()).backward()
         return ref_loss, ref_scores.grad

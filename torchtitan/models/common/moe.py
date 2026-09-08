@@ -400,6 +400,11 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
             normalized score.
     Eq. 17: ``L_bal = sum_i f_i * p_i``
 
+    The returned value is ``T * L_bal`` (token-mode): Eqs 17-20 define a
+    per-token-normalized value, while ``LoggedAuxLoss`` scales every auxiliary
+    loss by ``1 / per_step_denominator`` (the step's token count), so the
+    sum-type form keeps the injected weight at ``coeff * L_bal``.
+
     The counts (Eq. 18) and normalized-score sums (Eq. 19) are sums over the
     folded token dim, hence Partial over the mesh axes that shard it (CP
     always, plus TP under EP).  They are all-reduced to Invariant before
@@ -497,8 +502,7 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
 
             # Eq. 19 sums: per-expert sum of per-token normalized scores.
             probs_TE = scores_TE / scores_TE.sum(dim=-1, keepdim=True)
-            prob_sums_E = self._reduce_token_partials(probs_TE.sum(dim=0), axes)
-            p_E = prob_sums_E / num_tokens
+            p_E = self._reduce_token_partials(probs_TE.sum(dim=0), axes)
 
             # Eq. 17: L_bal = sum_i f_i * p_i
             loss = (f_E * p_E).sum()
