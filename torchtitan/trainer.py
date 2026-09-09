@@ -51,7 +51,7 @@ from torchtitan.distributed.activation_checkpoint import (
 )
 from torchtitan.distributed.cudagraph import cudagraph_teardown, wrap_with_cuda_graph
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
-from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.models.common.aux_loss import collect_aux_loss_metrics, LoggedAuxLoss
 from torchtitan.models.common.token_dispatcher import (
     HybridEPTokenDispatcher,
     LocalTokenDispatcher,
@@ -390,32 +390,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             distinct_seed_mesh_dims=["pp"],
         )
 
-        # Resolve the global per-step token budget before model configs are
-        # built (Decoder.update_from_config needs the resolved value for the
-        # aux-loss normalization denominator).
-        self.num_pp_microbatches = (
-            config.parallelism.num_pp_microbatches if parallel_dims.pp_enabled else 1
-        )
-        num_tokens_per_dp_rank = (
-            config.training.num_tokens_per_microbatch_per_dp_rank
-            * self.num_pp_microbatches
-        )
-        num_tokens_per_grad_step = num_tokens_per_dp_rank * dp_degree
-        num_tokens_per_train_step = config.training.num_tokens_per_train_step
-        if num_tokens_per_train_step < 0:
-            num_tokens_per_train_step = num_tokens_per_grad_step
-        if num_tokens_per_train_step % num_tokens_per_grad_step != 0:
-            raise ValueError(
-                "training.num_tokens_per_train_step "
-                f"({num_tokens_per_train_step}) must be divisible by the number "
-                "of tokens processed globally in one gradient accumulation "
-                f"iteration ({num_tokens_per_grad_step})."
-            )
-        self.gradient_accumulation_steps = (
-            num_tokens_per_train_step // num_tokens_per_grad_step
-        )
-        config.training.num_tokens_per_train_step = num_tokens_per_train_step
-
         # build model (using meta init)
         model_config = model_spec.model
         # set the model args from training job configs
@@ -490,6 +464,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             compile_config=config.compile,
         )
 
+        self.num_pp_microbatches = (
+            config.parallelism.num_pp_microbatches if parallel_dims.pp_enabled else 1
+        )
+        num_tokens_per_dp_rank = (
+            config.training.num_tokens_per_microbatch_per_dp_rank
+            * self.num_pp_microbatches
+        )
+        num_tokens_per_train_step = config.training.num_tokens_per_train_step
+        if num_tokens_per_train_step < 0:
+            num_tokens_per_train_step = num_tokens_per_dp_rank * dp_degree
+        if num_tokens_per_train_step % (num_tokens_per_dp_rank * dp_degree) != 0:
+            raise ValueError(
+                "training.num_tokens_per_train_step "
+                f"({num_tokens_per_train_step}) must be divisible by the number "
+                "of tokens processed globally in one gradient accumulation "
+                f"iteration ({num_tokens_per_dp_rank * dp_degree})."
+            )
+        self.gradient_accumulation_steps = num_tokens_per_train_step // (
+            num_tokens_per_dp_rank * dp_degree
+        )
         # apply parallelisms and initialization
         with sl.log_trace_span("model_parallelism_init"):
             if parallel_dims.pp_enabled:
@@ -916,6 +910,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
         else:
             global_valid_tokens = local_valid_tokens_tensor
+
+        # Auxiliary losses normalize by the same per-step token count as the
+        # main loss, so their scale is independent of parallelism degrees.
+        LoggedAuxLoss.set_step_denominator(global_valid_tokens)
 
         # Process each gradient accumulation step, then free its inputs.
         accumulated_loss: torch.Tensor | None = None

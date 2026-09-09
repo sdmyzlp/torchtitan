@@ -326,9 +326,7 @@ def make_moe_config(
     if aux_loss_coeff is not None:
         router = dataclasses.replace(
             router,
-            aux_loss=SeqwiseLoadBalanceLoss.Config(
-                coeff=aux_loss_coeff, top_k=router.top_k
-            ),
+            aux_loss=SeqwiseLoadBalanceLoss.Config(coeff=aux_loss_coeff),
         )
     return MoE.Config(
         num_experts=num_experts,

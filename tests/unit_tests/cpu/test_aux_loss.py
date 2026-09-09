@@ -10,6 +10,9 @@ TestCase groups:
 - TestSeqwiseLoadBalanceLossNumerics: forward/backward values vs an explicit
   formula reference, injected gradient vs explicit loss, and non-differentiability
   of the one-hot counts.
+- TestSeqwiseLoadBalanceLossConfig: the loss's own Config builds the loss (the
+  router is configured with a config, and ``Config.build()`` constructs the
+  config's owner class).
 - TestLoggedAuxLossAccumulation: forward-side accumulation semantics,
   roll-up/zero semantics, and that torch_remat checkpointing accumulates the
   metric exactly once via the loss's own retained region.
@@ -37,6 +40,11 @@ from torchtitan.models.common.aux_loss import (
     collect_aux_loss_metrics,
     LoggedAuxLoss,
 )
+from torchtitan.models.common.config_utils import (
+    make_moe_config,
+    make_routed_experts_config,
+    make_router_config,
+)
 from torchtitan.models.common.moe import SeqwiseLoadBalanceLoss
 
 
@@ -48,7 +56,7 @@ def _set_spmd_types_backend():
 
 def _reference_seqwise_aux_loss(
     scores_TE: torch.Tensor,
-    topk_expert_ids_TK: torch.Tensor,
+    routing_map_TE: torch.Tensor,
     top_k: int,
     coeff: float,
     per_step_denominator: int,
@@ -63,9 +71,6 @@ def _reference_seqwise_aux_loss(
     """
     E = scores_TE.size(-1)
     T = scores_TE.size(0)
-    routing_map_TE = torch.zeros_like(scores_TE, dtype=torch.bool).scatter_(
-        -1, topk_expert_ids_TK, True
-    )
     counts_E = routing_map_TE.sum(dim=0).to(scores_TE.dtype)
     probs_TE = scores_TE / scores_TE.sum(dim=-1, keepdim=True)
     prob_sums_E = probs_TE.sum(dim=0)
@@ -80,8 +85,10 @@ def _make_loss_module(
     per_step_denominator: int,
 ) -> SeqwiseLoadBalanceLoss:
     """Build a SeqwiseLoadBalanceLoss with the given parameters."""
-    cfg = SeqwiseLoadBalanceLoss.Config(coeff=coeff, top_k=top_k)
-    cfg.per_step_denominator = per_step_denominator
+    LoggedAuxLoss.set_step_denominator(
+        torch.tensor(float(per_step_denominator), dtype=torch.float64)
+    )
+    cfg = SeqwiseLoadBalanceLoss.Config(coeff=coeff)
     loss = SeqwiseLoadBalanceLoss(cfg)
     loss.train()
     return loss
@@ -91,6 +98,7 @@ def _clear_aux_loss_registry():
     """Reset the class-level metric registry for the current process."""
     LoggedAuxLoss._group_counts.clear()
     LoggedAuxLoss.group_acc.clear()
+    LoggedAuxLoss._step_denominator = None
 
 
 def _make_inputs(T: int, E: int, K: int):
@@ -99,7 +107,10 @@ def _make_inputs(T: int, E: int, K: int):
         scores_TE.detach(), k=K, dim=-1, sorted=False
     ).indices
     topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
-    return scores_TE, topk_scores_TK, topk_expert_ids_TK
+    routing_map_TE = torch.zeros(T, E, dtype=torch.bool).scatter_(
+        -1, topk_expert_ids_TK, True
+    )
+    return scores_TE, topk_scores_TK, routing_map_TE
 
 
 class TestSeqwiseLoadBalanceLossNumerics(unittest.TestCase):
@@ -119,12 +130,10 @@ class TestSeqwiseLoadBalanceLossNumerics(unittest.TestCase):
     def test_loss_value_matches_formula(self):
         """The accumulated metric after the forward equals the reference
         formula (the metric accumulates in the forward)."""
-        scores_TE, topk_scores_TK, topk_expert_ids_TK = _make_inputs(
-            self.T, self.E, self.K
-        )
+        scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
         loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
 
-        out_TK = loss(scores_TE, topk_expert_ids_TK, carrier=topk_scores_TK)
+        out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
         self.assertTrue(torch.equal(out_TK, topk_scores_TK))
 
         _zero_aux_losses([loss])
@@ -134,7 +143,7 @@ class TestSeqwiseLoadBalanceLossNumerics(unittest.TestCase):
         self.assertIsNotNone(group_acc_value)
         ref = _reference_seqwise_aux_loss(
             scores_TE,
-            topk_expert_ids_TK,
+            routing_map_TE,
             self.K,
             self.coeff,
             self.per_step_denominator,
@@ -147,13 +156,11 @@ class TestSeqwiseLoadBalanceLossNumerics(unittest.TestCase):
 
     def test_gradient_injected_via_carrier(self):
         """The aux loss gradient flows through the carrier tensor."""
-        scores_TE, topk_scores_TK, topk_expert_ids_TK = _make_inputs(
-            self.T, self.E, self.K
-        )
+        scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
         loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
 
         topk_scores_TK.retain_grad()
-        out_TK = loss(scores_TE, topk_expert_ids_TK, carrier=topk_scores_TK)
+        out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
         out_TK.sum().backward()
         self.assertIsNotNone(topk_scores_TK.grad)
         self.assertFalse(torch.all(topk_scores_TK.grad == 0))
@@ -161,15 +168,52 @@ class TestSeqwiseLoadBalanceLossNumerics(unittest.TestCase):
     def test_counts_gradient_is_zero(self):
         """The gradient flows only through the normalized-probs path; the
         one-hot counts (Eq. 18) are non-differentiable."""
-        scores_TE, topk_scores_TK, topk_expert_ids_TK = _make_inputs(
-            self.T, self.E, self.K
-        )
+        scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
         loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
 
-        out_TK = loss(scores_TE, topk_expert_ids_TK, carrier=topk_scores_TK)
+        out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
         out_TK.sum().backward()
         self.assertIsNotNone(scores_TE.grad)
         self.assertGreater(torch.abs(scores_TE.grad).sum().item(), 0)
+
+
+class TestSeqwiseLoadBalanceLossConfig(unittest.TestCase):
+    """The loss's own Config builds the loss, not the base LoggedAuxLoss."""
+
+    def setUp(self):
+        _set_spmd_types_backend()
+        _clear_aux_loss_registry()
+
+    def tearDown(self):
+        _clear_aux_loss_registry()
+
+    def test_config_builds_the_loss(self):
+        """The router is configured with a config whose build() constructs the
+        config's owner class, so the config must be owned by this loss: a
+        LoggedAuxLoss-owned config builds a module without a forward."""
+        LoggedAuxLoss.set_step_denominator(torch.tensor(4.0, dtype=torch.float64))
+        loss = SeqwiseLoadBalanceLoss.Config(coeff=0.125).build()
+        self.assertIs(type(loss), SeqwiseLoadBalanceLoss)
+        self.assertIs(type(LoggedAuxLoss.Config(coeff=0.125).build()), LoggedAuxLoss)
+        self.assertEqual(loss.coeff, 0.125)
+
+    def test_make_moe_config_uses_this_loss(self):
+        """The model flavors set the aux loss through make_moe_config; that
+        path must install a config owned by this loss."""
+        moe_cfg = make_moe_config(
+            num_experts=4,
+            router=make_router_config(dim=8, num_experts=4, gate_param_init={}),
+            routed_experts=make_routed_experts_config(
+                dim=8,
+                hidden_dim=16,
+                num_experts=4,
+                top_k=1,
+                param_init={},
+                comm_backend="standard",
+            ),
+            aux_loss_coeff=1e-3,
+        )
+        self.assertIs(type(moe_cfg.router.aux_loss.build()), SeqwiseLoadBalanceLoss)
 
 
 class TestLoggedAuxLossAccumulation(unittest.TestCase):
@@ -192,15 +236,15 @@ class TestLoggedAuxLossAccumulation(unittest.TestCase):
         num_forwards = 3
         ref_total = 0.0
         for _ in range(num_forwards):
-            scores_TE, topk_scores_TK, topk_expert_ids_TK = _make_inputs(
+            scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(
                 self.T, self.E, self.K
             )
-            out_TK = loss(scores_TE, topk_expert_ids_TK, carrier=topk_scores_TK)
+            out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
             # force gradient path too
             out_TK.sum().backward()
             ref_total += _reference_seqwise_aux_loss(
                 scores_TE,
-                topk_expert_ids_TK,
+                routing_map_TE,
                 self.K,
                 1.0,
                 self.per_step_denominator,
@@ -216,10 +260,8 @@ class TestLoggedAuxLossAccumulation(unittest.TestCase):
     def test_rollup_then_clear(self):
         """After the roll-up into group_acc, each instance accumulator is zeroed."""
         loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
-        scores_TE, topk_scores_TK, topk_expert_ids_TK = _make_inputs(
-            self.T, self.E, self.K
-        )
-        out_TK = loss(scores_TE, topk_expert_ids_TK, carrier=topk_scores_TK)
+        scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
+        out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
         out_TK.sum().backward()
 
         _zero_aux_losses([loss])
@@ -230,25 +272,26 @@ class TestLoggedAuxLossAccumulation(unittest.TestCase):
         checkpointing: the metric is counted exactly once per microbatch
         without the call site declaring anything."""
         loss_guarded = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
-        (
-            scores_TE2,
-            topk_scores_TK2,
-            topk_expert_ids_TK2,
-        ) = _make_inputs(self.T, self.E, self.K)
+        scores_TE2, topk_scores_TK2, routing_map_TE2 = _make_inputs(
+            self.T, self.E, self.K
+        )
 
-        def _forward_once(module, carrier, scores_TE, expert_ids):
+        def _forward_once(module, carrier, scores_TE, routing_map_TE):
             # LoggedAuxLoss.inject() wraps its accumulation in a retained
             # remat region itself, so a plain call must not double count
             # when the enclosing checkpoint replays.
-            return module(scores_TE, expert_ids, carrier=carrier).sum()
+            return module(scores_TE, routing_map_TE, carrier=carrier).sum()
 
         out = remat.checkpoint()(_forward_once)(
-            loss_guarded, topk_scores_TK2, scores_TE2, topk_expert_ids_TK2
+            loss_guarded,
+            topk_scores_TK2,
+            scores_TE2,
+            routing_map_TE2,
         )
         out.backward()
         _zero_aux_losses([loss_guarded])
         single = _reference_seqwise_aux_loss(
-            scores_TE2, topk_expert_ids_TK2, self.K, 1.0, self.per_step_denominator
+            scores_TE2, routing_map_TE2, self.K, 1.0, self.per_step_denominator
         ).item()
         self.assertAlmostEqual(
             LoggedAuxLoss.group_acc[("batch", "seqwise_load_balance_loss")].item(),
@@ -299,9 +342,8 @@ class TestSeqwiseLossSpmdTypes(DTensorTestBase):
         return parallel_dims, dense_mesh
 
     def _make_loss_config(self, top_k: int):
-        cfg = SeqwiseLoadBalanceLoss.Config(coeff=0.1, top_k=top_k)
-        cfg.per_step_denominator = 1
-        return cfg
+        LoggedAuxLoss.set_step_denominator(torch.tensor(1.0, dtype=torch.float64))
+        return SeqwiseLoadBalanceLoss.Config(coeff=0.1)
 
     def _reference_for_stream(self, scores, ids, top_k, E, coeff=0.1):
         """Reference loss and gradient for a single dp-rank token stream."""
@@ -414,19 +456,25 @@ class TestSeqwiseLossSpmdTypes(DTensorTestBase):
         with set_current_spmd_mesh(dense_mesh), checker:
             torch.manual_seed(0)
             global_scores = torch.rand(T, E, dtype=torch.float64)
-            global_ids = torch.randint(0, E, (T, K))
             with spmd.no_typecheck():
+                # Distinct ids per token, like torch.topk in the router, so
+                # each token contributes exactly K one-hot entries.
+                global_ids = torch.topk(torch.rand(T, E), k=K, dim=-1).indices
                 local_scores = global_scores[t_start:t_end].contiguous()
                 local_ids = global_ids[t_start:t_end].contiguous()
+                local_routing_map = torch.zeros(
+                    local_ids.shape[0], E, dtype=torch.bool
+                ).scatter_(-1, local_ids, True)
 
             spmd.assert_type(local_scores, placement)
             spmd.assert_type(local_ids, placement)
+            spmd.assert_type(local_routing_map, placement)
 
             loss = SeqwiseLoadBalanceLoss(self._make_loss_config(K))
 
             local_scores.requires_grad_(True)
             carrier = local_scores.gather(dim=-1, index=local_ids)
-            out = loss(local_scores, local_ids, carrier=carrier)
+            out = loss(local_scores, local_routing_map, carrier=carrier)
             with spmd.no_typecheck():
                 torch.testing.assert_close(out, carrier, rtol=0, atol=0)
                 # Backward runs outside the checker in both modes: with EP off
@@ -438,8 +486,9 @@ class TestSeqwiseLossSpmdTypes(DTensorTestBase):
                 dp_scores = global_scores[dp_start : dp_start + t_dp]
                 dp_ids = global_ids[dp_start : dp_start + t_dp]
                 ref_loss, ref_grad = self._reference_for_stream(dp_scores, dp_ids, K, E)
+                # The metric accumulator is float32 (the reference is float64).
                 self.assertAlmostEqual(
-                    loss.instance_acc.item(), ref_loss.item(), places=6
+                    loss.instance_acc.item(), ref_loss.item(), places=4
                 )
                 ref_local_grad = ref_grad[shard * t_blk : (shard + 1) * t_blk]
                 self.assertLess(
@@ -458,7 +507,7 @@ class TestSeqwiseLossSpmdTypes(DTensorTestBase):
             i = global_ids[stream * t_dp : (stream + 1) * t_dp]
             ref_total += self._reference_for_stream(s, i, K, E)[0].item()
         self.assertAlmostEqual(
-            metrics["seqwise_load_balance_loss/mean"], ref_total, places=6
+            metrics["seqwise_load_balance_loss/mean"], ref_total, places=4
         )
         _clear_aux_loss_registry()
 

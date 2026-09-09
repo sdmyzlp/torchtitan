@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -211,7 +210,7 @@ class TokenChoiceTopKRouter(Module):
         score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sigmoid"
         route_norm: bool = False
         route_scale: float = 1.0
-        aux_loss: SeqwiseLoadBalanceLoss.Config | None = None
+        aux_loss: LoggedAuxLoss.Config | None = None
         _debug_force_load_balance: bool = False
 
     def __init__(self, config: Config):
@@ -356,15 +355,6 @@ class TokenChoiceTopKRouter(Module):
             topk_scores_TK = topk_scores_TK / denominator
         topk_scores_TK = topk_scores_TK * self.route_scale
 
-        # Auxiliary load-balance loss (DeepSeek-V3 Sec 2.1.2 Eqs 17-20).
-        # The gradient is injected into topk_scores_TK on backward; the loss
-        # itself keeps its forward-side metric accumulation from being re-run
-        # by activation checkpointing (see ``LoggedAuxLoss.inject``).
-        if self.training and self.aux_loss is not None:
-            topk_scores_TK = self.aux_loss(
-                scores_TE, topk_expert_ids_TK, carrier=topk_scores_TK
-            )
-
         # Build a one-hot boolean routing map (T, E) marking the experts each
         # token is routed to.  Under TP/SP the router outputs are DTensors
         # sharded on the token dim; scatter_ writes along the (replicated)
@@ -374,6 +364,20 @@ class TokenChoiceTopKRouter(Module):
             topk_expert_ids_TK,
             True,
         )
+
+        # Auxiliary load-balance loss (DeepSeek-V3 Sec 2.1.2 Eqs 17-20).
+        # The gradient is injected into topk_scores_TK on backward; the loss
+        # itself keeps its forward-side metric accumulation from being re-run
+        # by activation checkpointing (see ``LoggedAuxLoss.inject``).  The
+        # routing map is passed in so the loss counts exactly the tokens this
+        # router counted: once the router masks padding positions out of the
+        # map, the loss and its token count follow without further changes.
+        if self.training and self.aux_loss is not None:
+            topk_scores_TK = self.aux_loss(
+                scores_TE,
+                routing_map_TE,
+                carrier=topk_scores_TK,
+            )
 
         return (
             topk_scores_TK,
@@ -402,7 +406,7 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
 
     The returned value is ``T * L_bal`` (token-mode): Eqs 17-20 define a
     per-token-normalized value, while ``LoggedAuxLoss`` scales every auxiliary
-    loss by ``1 / per_step_denominator`` (the step's token count), so the
+    loss by ``1 / global_valid_tokens`` (the step's valid-token count), so the
     sum-type form keeps the injected weight at ``coeff * L_bal``.
 
     The counts (Eq. 18) and normalized-score sums (Eq. 19) are sums over the
@@ -411,15 +415,22 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
     the formula, so every rank computes the same per-forward loss.  The
     one-hot counts are non-differentiable: the gradient reaches the router
     only through the normalized-score sums and the top-k score carrier.
-    ``T`` is the forward's token count: the local shard scaled by the degrees
-    of the axes that shard it, read from runtime state (the registered EP mesh
-    and the mesh axis sizes), not from tensor annotations: annotations only
-    exist under ``--debug.spmd_typechecking``.
+    ``T`` is the forward's token count: the code evaluates Eq. 18 in the
+    T-free form ``f_i = E * counts_i / sum_j counts_j``, which equals
+    ``(E / (K T)) * counts_i`` because each token contributes K entries, so
+    ``sum_j counts_j = K T``.  That needs no shape or mesh-degree assumption
+    and follows any masking the router applies to the routing map.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(LoggedAuxLoss.Config):
-        top_k: int
+        """Same fields as ``LoggedAuxLoss.Config``; this loss adds no knobs.
+
+        A distinct Config is required even without new fields: ``Config.build()``
+        constructs the class that owns the config (``__init_subclass__`` sets
+        ``_owner``), so a router configured with ``LoggedAuxLoss.Config`` would
+        build a plain ``LoggedAuxLoss``, which has no ``forward``.
+        """
 
     def __init__(self, config: Config):
         # Validate before the base constructor mutates the global metric
@@ -431,7 +442,6 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
                 "counts all-reduce relies on spmd_types mesh semantics."
             )
         super().__init__(config)
-        self.top_k = config.top_k
 
     def _reduce_token_partials(
         self, partial_E: torch.Tensor, axes: tuple[str, ...]
@@ -461,7 +471,7 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
     def forward(
         self,
         scores_TE: torch.Tensor,
-        topk_expert_ids_TK: torch.Tensor,
+        routing_map_TE: torch.Tensor,
         *,
         carrier: torch.Tensor,
     ) -> torch.Tensor:
@@ -469,7 +479,8 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
 
         Args:
             scores_TE: Router scores ``(T, E)`` for the forward's tokens.
-            topk_expert_ids_TK: Top-k expert indices ``(T, K)``.
+            routing_map_TE: One-hot routing map ``(T, E)`` for the same tokens,
+                as counted by the router.
             carrier: Tensor whose backward path carries the injected
                 gradient (the router's top-k scores).
 
@@ -480,28 +491,30 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
         # independent token stream, so DP must not be reduced; only the
         # global axes that shard the stream (CP, TP under EP) are.
         with spmd_local_context("dp"):
-            T, E = scores_TE.shape
+            E = scores_TE.size(-1)
             # Axes that shard the router output's token dim: CP in every
             # layout, TP only under EP, which distributes tokens over TP (the
             # gate computes and emits dense_sequence_parallel_placement
             # whenever EP is on, and tokens_per_expert_E is TP-Partial for the
-            # same reason).  The forward's token count is the local shard
-            # scaled by their degrees.
+            # same reason).
             axes = ("cp", "tp") if spmd_sparse_mesh() is not None else ("cp",)
-            num_tokens = T * math.prod(spmd_mesh_size(axis) for axis in axes)
 
-            # Eq. 18 counts: per-expert routing frequency over the forward's
-            # tokens.  The one-hot map is float (not bool) so the counts sum
-            # needs no dtype cast: casting a Partial tensor is non-linear and
-            # rejected by spmd_types typechecking.
-            routing_map_TE = torch.zeros_like(scores_TE).scatter_(
-                -1, topk_expert_ids_TK, 1.0
+            # Eq. 18: per-expert routing frequency counts_i over the forward's
+            # tokens, then f_i = E * counts_i / sum_j counts_j (so
+            # sum_i f_i = E).  The latter is the (E / (K T)) form with
+            # T = sum_j counts_j / K, so it needs no token count, shape or mesh
+            # degree and follows any masking the router applies to the map.
+            # The map is cast to float before the reduction: casting a Partial
+            # tensor is non-linear and rejected by spmd_types.
+            counts_E = self._reduce_token_partials(
+                routing_map_TE.to(scores_TE.dtype).sum(dim=0), axes
             )
-            counts_E = self._reduce_token_partials(routing_map_TE.sum(dim=0), axes)
-            f_E = counts_E * (E / (self.top_k * num_tokens))
+            f_E = F.normalize(counts_E, p=1, dim=0) * E
 
-            # Eq. 19 sums: per-expert sum of per-token normalized scores.
-            probs_TE = scores_TE / scores_TE.sum(dim=-1, keepdim=True)
+            # Eq. 19: p_i = (1/T) sum_t s'_t,i, the per-token L1-normalized
+            # scores.  F.normalize's eps clamp only guards an all-zero score
+            # row: the scores are non-negative, so the norm is a plain sum.
+            probs_TE = F.normalize(scores_TE, p=1, dim=-1)
             p_E = self._reduce_token_partials(probs_TE.sum(dim=0), axes)
 
             # Eq. 17: L_bal = sum_i f_i * p_i
