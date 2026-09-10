@@ -6,20 +6,11 @@
 
 """Tests for LoggedAuxLoss and SeqwiseLoadBalanceLoss.
 
-TestCase groups:
-- TestSeqwiseLoadBalanceLossNumerics: forward/backward values vs an explicit
-  formula reference, injected gradient vs explicit loss, and non-differentiability
-  of the one-hot counts.
-- TestSeqwiseLoadBalanceLossConfig: the loss's own Config builds the loss (the
-  router is configured with a config, and ``Config.build()`` constructs the
-  config's owner class).
-- TestLoggedAuxLossAccumulation: forward-side accumulation semantics,
-  roll-up/zero semantics, and that torch_remat checkpointing accumulates the
-  metric exactly once via the loss's own retained region.
-- TestSeqwiseLossSpmdTypes: 8-rank (dp2/cp2/tp2/ep2) spmd_types test on CPU
-  float64 + gloo; per-forward loss and gradient match the global per-DP-rank
-  reference with and without the SPMD typechecker, and with/without EP
-  token sharding.
+The single-process cases check the loss value, the injected gradient and the
+metric register against an explicit Eqs 17-20 reference; the 8-rank cases
+(dp2/cp2/tp2, EP on and off, CPU float64 + gloo) check that the per-DP-rank
+statistics are whole-stream statistics and that the collected metric sums the
+DP ranks' streams, with and without the SPMD typechecker.
 """
 
 import contextlib
@@ -47,51 +38,14 @@ from torchtitan.models.common.config_utils import (
 )
 from torchtitan.models.common.moe import SeqwiseLoadBalanceLoss
 
+_COEFF = 0.1
+_METRIC_KEY = ("batch", "seqwise_load_balance_loss")
+
 
 def _set_spmd_types_backend():
     from torchtitan.distributed.utils import set_spmd_backend
 
     set_spmd_backend("spmd_types")
-
-
-def _reference_seqwise_aux_loss(
-    scores_TE: torch.Tensor,
-    routing_map_TE: torch.Tensor,
-    top_k: int,
-    coeff: float,
-    per_step_denominator: int,
-) -> torch.Tensor:
-    """Explicit DeepSeek-V3 per-forward aux loss (Eqs 17-20), framework-scaled.
-
-    Eqs 17-20 define a per-token-normalized value; the loss uses the
-    token-mode (sum-type) form, i.e. ``T`` times that value, so that the
-    framework's ``1 / per_step_denominator`` scaling lands on the per-token
-    scale.  ``T`` is the number of tokens in the forward (the whole input,
-    matching the single-process shape-derived count).
-    """
-    E = scores_TE.size(-1)
-    T = scores_TE.size(0)
-    counts_E = routing_map_TE.sum(dim=0).to(scores_TE.dtype)
-    probs_TE = scores_TE / scores_TE.sum(dim=-1, keepdim=True)
-    prob_sums_E = probs_TE.sum(dim=0)
-    f_E = counts_E * (E / (top_k * T))
-    p_E = prob_sums_E / T
-    return (f_E * p_E).sum() * T * (coeff / per_step_denominator)
-
-
-def _make_loss_module(
-    top_k: int,
-    coeff: float,
-    per_step_denominator: int,
-) -> SeqwiseLoadBalanceLoss:
-    """Build a SeqwiseLoadBalanceLoss with the given parameters."""
-    LoggedAuxLoss.set_step_denominator(
-        torch.tensor(float(per_step_denominator), dtype=torch.float64)
-    )
-    cfg = SeqwiseLoadBalanceLoss.Config(coeff=coeff)
-    loss = SeqwiseLoadBalanceLoss(cfg)
-    loss.train()
-    return loss
 
 
 def _clear_aux_loss_registry():
@@ -101,105 +55,160 @@ def _clear_aux_loss_registry():
     LoggedAuxLoss._step_denominator = None
 
 
-def _make_inputs(T: int, E: int, K: int):
-    scores_TE = torch.rand(T, E, dtype=torch.float32, requires_grad=True)
-    topk_expert_ids_TK = torch.topk(
-        scores_TE.detach(), k=K, dim=-1, sorted=False
-    ).indices
-    topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
-    routing_map_TE = torch.zeros(T, E, dtype=torch.bool).scatter_(
-        -1, topk_expert_ids_TK, True
+def _reference_loss(
+    scores_TE: torch.Tensor,
+    routing_map_TE: torch.Tensor,
+    top_k: int,
+    *,
+    coeff: float = 1.0,
+) -> torch.Tensor:
+    """Explicit DeepSeek-V3 Eqs 17-20 reference, in the loss's token-mode form.
+
+    Eq. 18 ``f_i = (E / (K T)) * counts_i`` and Eq. 19
+    ``p_i = (1 / T) * sum_t s'_t,i`` over the whole input, with ``T`` the
+    input's token count; the sum-type (token-mode) form multiplies ``T`` back
+    in, and ``coeff`` stands for the framework's ``coeff / denominator``.
+    """
+    E, T = scores_TE.size(-1), scores_TE.size(0)
+    counts_E = routing_map_TE.sum(dim=0).to(scores_TE.dtype)
+    probs_TE = scores_TE / scores_TE.sum(dim=-1, keepdim=True)
+    f_E = counts_E * (E / (top_k * T))
+    p_E = probs_TE.sum(dim=0) / T
+    return (f_E * p_E).sum() * T * coeff
+
+
+def _routing_map(ids_TK: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """One-hot routing map for ``(T, K)`` expert ids."""
+    return torch.zeros(ids_TK.shape[0], num_experts, dtype=torch.bool).scatter_(
+        -1, ids_TK, True
     )
-    return scores_TE, topk_scores_TK, routing_map_TE
 
 
-class TestSeqwiseLoadBalanceLossNumerics(unittest.TestCase):
-    """Forward/backward of SeqwiseLoadBalanceLoss vs an explicit reference."""
+def _make_inputs(T: int, E: int, K: int):
+    """Router-like ``(scores_TE, carrier_TK, routing_map_TE)`` in float64."""
+    scores_TE = torch.rand(T, E, dtype=torch.float64, requires_grad=True)
+    ids_TK = torch.topk(scores_TE.detach(), k=K, dim=-1, sorted=False).indices
+    return scores_TE, scores_TE.gather(dim=-1, index=ids_TK), _routing_map(ids_TK, E)
+
+
+def _make_loss(coeff: float, per_step_denominator: int) -> SeqwiseLoadBalanceLoss:
+    """Loss with the given coeff and an explicit step denominator.
+
+    The denominator is float64 here so the assertions stay exact; in training
+    it is the step's int64 ``global_valid_tokens``.
+    """
+    LoggedAuxLoss.set_step_denominator(
+        torch.tensor(float(per_step_denominator), dtype=torch.float64)
+    )
+    loss = SeqwiseLoadBalanceLoss(SeqwiseLoadBalanceLoss.Config(coeff=coeff))
+    loss.train()
+    return loss
+
+
+class _AuxLossTestCase(unittest.TestCase):
+    """spmd_types backend and a clean metric registry for every test."""
 
     def setUp(self):
-        self.T, self.E, self.K = 15, 7, 2
-        self.coeff = 0.125
-        self.per_step_denominator = 8
-        torch.manual_seed(0)
         _set_spmd_types_backend()
         _clear_aux_loss_registry()
 
     def tearDown(self):
         _clear_aux_loss_registry()
 
-    def test_loss_value_matches_formula(self):
-        """The accumulated metric after the forward equals the reference
-        formula (the metric accumulates in the forward)."""
-        scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
-        loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
 
-        out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
-        self.assertTrue(torch.equal(out_TK, topk_scores_TK))
+class TestSeqwiseLoadBalanceLoss(_AuxLossTestCase):
+    """Numerics vs the reference, metric accumulation, and torch_remat safety."""
+
+    def setUp(self):
+        super().setUp()
+        self.T, self.E, self.K = 15, 7, 2
+        self.coeff, self.denominator = 0.125, 8
+        torch.manual_seed(0)
+
+    def test_value_and_gradient_match_reference(self):
+        """The forward is an identity on the carrier, the register accumulates
+        the reference value, and the injected gradient equals the reference's:
+        the gradient reaches the router through the normalized scores and the
+        carrier, never through the one-hot counts."""
+        scores_TE, carrier_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
+        loss = _make_loss(self.coeff, self.denominator)
+
+        out_TK = loss(scores_TE, routing_map_TE, carrier=carrier_TK)
+        self.assertTrue(torch.equal(out_TK, carrier_TK))
+
+        # The register holds the raw value over the denominator (no coeff),
+        # in float32, hence the tolerance.
+        _zero_aux_losses([loss])
+        ref = _reference_loss(scores_TE, routing_map_TE, self.K).item()
+        self.assertAlmostEqual(
+            LoggedAuxLoss.group_acc[_METRIC_KEY].item(),
+            ref / self.denominator,
+            places=4,
+        )
+
+        ref_scores = scores_TE.detach().clone().requires_grad_(True)
+        ref_aux = _reference_loss(
+            ref_scores, routing_map_TE, self.K, coeff=self.coeff / self.denominator
+        )
+        # The carrier adds its own gradient path, as it does in the forward.
+        (ref_aux + (ref_scores * routing_map_TE).sum()).backward()
+        out_TK.sum().backward()
+        self.assertLess((scores_TE.grad - ref_scores.grad).abs().max().item(), 1e-10)
+
+    def test_accumulates_forwards_then_clears(self):
+        """Every forward adds its scaled value to the register, and the roll-up
+        into group_acc zeroes the instance accumulator."""
+        loss = _make_loss(self.coeff, self.denominator)
+        ref_total = 0.0
+        for _ in range(3):
+            scores_TE, carrier_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
+            out_TK = loss(scores_TE, routing_map_TE, carrier=carrier_TK)
+            out_TK.sum().backward()
+            ref_total += _reference_loss(scores_TE, routing_map_TE, self.K).item()
 
         _zero_aux_losses([loss])
-        group_acc_value = LoggedAuxLoss.group_acc.get(
-            ("batch", "seqwise_load_balance_loss")
-        )
-        self.assertIsNotNone(group_acc_value)
-        ref = _reference_seqwise_aux_loss(
-            scores_TE,
-            routing_map_TE,
-            self.K,
-            self.coeff,
-            self.per_step_denominator,
-        )
-        # group_acc holds raw_sum / denominator, and ref = raw_sum * coeff /
-        # denominator, so the register equals ref / coeff.
         self.assertAlmostEqual(
-            group_acc_value.item(), ref.item() / self.coeff, places=4
+            LoggedAuxLoss.group_acc[_METRIC_KEY].item(),
+            ref_total / self.denominator,
+            places=3,
+        )
+        self.assertEqual(loss.instance_acc.item(), 0.0)
+
+    def test_no_double_count_with_remat_checkpointing(self):
+        """inject() keeps the accumulation in its own retained remat region, so
+        replaying an enclosing checkpoint counts each forward exactly once."""
+        loss = _make_loss(self.coeff, self.denominator)
+        scores_TE, carrier_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
+
+        def _forward_once(module, carrier, scores_TE, routing_map_TE):
+            return module(scores_TE, routing_map_TE, carrier=carrier).sum()
+
+        out = remat.checkpoint()(_forward_once)(
+            loss, carrier_TK, scores_TE, routing_map_TE
+        )
+        out.backward()
+        _zero_aux_losses([loss])
+        ref = _reference_loss(scores_TE, routing_map_TE, self.K).item()
+        self.assertAlmostEqual(
+            LoggedAuxLoss.group_acc[_METRIC_KEY].item(),
+            ref / self.denominator,
+            places=5,
         )
 
-    def test_gradient_injected_via_carrier(self):
-        """The aux loss gradient flows through the carrier tensor."""
-        scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
-        loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
 
-        topk_scores_TK.retain_grad()
-        out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
-        out_TK.sum().backward()
-        self.assertIsNotNone(topk_scores_TK.grad)
-        self.assertFalse(torch.all(topk_scores_TK.grad == 0))
-
-    def test_counts_gradient_is_zero(self):
-        """The gradient flows only through the normalized-probs path; the
-        one-hot counts (Eq. 18) are non-differentiable."""
-        scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
-        loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
-
-        out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
-        out_TK.sum().backward()
-        self.assertIsNotNone(scores_TE.grad)
-        self.assertGreater(torch.abs(scores_TE.grad).sum().item(), 0)
-
-
-class TestSeqwiseLoadBalanceLossConfig(unittest.TestCase):
+class TestSeqwiseLoadBalanceLossConfig(_AuxLossTestCase):
     """The loss's own Config builds the loss, not the base LoggedAuxLoss."""
 
-    def setUp(self):
-        _set_spmd_types_backend()
-        _clear_aux_loss_registry()
-
-    def tearDown(self):
-        _clear_aux_loss_registry()
-
     def test_config_builds_the_loss(self):
-        """The router is configured with a config whose build() constructs the
-        config's owner class, so the config must be owned by this loss: a
-        LoggedAuxLoss-owned config builds a module without a forward."""
-        LoggedAuxLoss.set_step_denominator(torch.tensor(4.0, dtype=torch.float64))
-        loss = SeqwiseLoadBalanceLoss.Config(coeff=0.125).build()
-        self.assertIs(type(loss), SeqwiseLoadBalanceLoss)
-        self.assertIs(type(LoggedAuxLoss.Config(coeff=0.125).build()), LoggedAuxLoss)
-        self.assertEqual(loss.coeff, 0.125)
+        """Config.build() constructs the config's owner class, so the config
+        the model flavors install through make_moe_config must be this loss's
+        own: a LoggedAuxLoss-owned config builds a module without a forward."""
+        self.assertIs(
+            type(SeqwiseLoadBalanceLoss.Config(coeff=_COEFF).build()),
+            SeqwiseLoadBalanceLoss,
+        )
+        self.assertIs(type(LoggedAuxLoss.Config(coeff=_COEFF).build()), LoggedAuxLoss)
 
-    def test_make_moe_config_uses_this_loss(self):
-        """The model flavors set the aux loss through make_moe_config; that
-        path must install a config owned by this loss."""
         moe_cfg = make_moe_config(
             num_experts=4,
             router=make_router_config(dim=8, num_experts=4, gate_param_init={}),
@@ -211,219 +220,82 @@ class TestSeqwiseLoadBalanceLossConfig(unittest.TestCase):
                 param_init={},
                 comm_backend="standard",
             ),
-            aux_loss_coeff=1e-3,
+            aux_loss_coeff=_COEFF,
         )
         self.assertIs(type(moe_cfg.router.aux_loss.build()), SeqwiseLoadBalanceLoss)
 
 
-class TestLoggedAuxLossAccumulation(unittest.TestCase):
-    """Accumulation, roll-up/zero semantics, and torch_remat checkpointing."""
-
-    def setUp(self):
-        self.T, self.E, self.K = 8, 4, 2
-        self.coeff = 0.1
-        self.per_step_denominator = 4
-        torch.manual_seed(42)
-        _set_spmd_types_backend()
-        _clear_aux_loss_registry()
-
-    def tearDown(self):
-        _clear_aux_loss_registry()
-
-    def test_accumulation_across_forwards(self):
-        """Multiple forwards accumulate the scaled per-forward values."""
-        loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
-        num_forwards = 3
-        ref_total = 0.0
-        for _ in range(num_forwards):
-            scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(
-                self.T, self.E, self.K
-            )
-            out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
-            # force gradient path too
-            out_TK.sum().backward()
-            ref_total += _reference_seqwise_aux_loss(
-                scores_TE,
-                routing_map_TE,
-                self.K,
-                1.0,
-                self.per_step_denominator,
-            ).item()
-
-        _zero_aux_losses([loss])
-        group_acc_value = LoggedAuxLoss.group_acc.get(
-            ("batch", "seqwise_load_balance_loss")
-        )
-        self.assertIsNotNone(group_acc_value)
-        self.assertAlmostEqual(group_acc_value.item(), ref_total, places=3)
-
-    def test_rollup_then_clear(self):
-        """After the roll-up into group_acc, each instance accumulator is zeroed."""
-        loss = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
-        scores_TE, topk_scores_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
-        out_TK = loss(scores_TE, routing_map_TE, carrier=topk_scores_TK)
-        out_TK.sum().backward()
-
-        _zero_aux_losses([loss])
-        self.assertEqual(loss.instance_acc.item(), 0.0)
-
-    def test_no_double_count_with_remat_checkpointing(self):
-        """The loss protects its own accumulation under torch_remat
-        checkpointing: the metric is counted exactly once per microbatch
-        without the call site declaring anything."""
-        loss_guarded = _make_loss_module(self.K, self.coeff, self.per_step_denominator)
-        scores_TE2, topk_scores_TK2, routing_map_TE2 = _make_inputs(
-            self.T, self.E, self.K
-        )
-
-        def _forward_once(module, carrier, scores_TE, routing_map_TE):
-            # LoggedAuxLoss.inject() wraps its accumulation in a retained
-            # remat region itself, so a plain call must not double count
-            # when the enclosing checkpoint replays.
-            return module(scores_TE, routing_map_TE, carrier=carrier).sum()
-
-        out = remat.checkpoint()(_forward_once)(
-            loss_guarded,
-            topk_scores_TK2,
-            scores_TE2,
-            routing_map_TE2,
-        )
-        out.backward()
-        _zero_aux_losses([loss_guarded])
-        single = _reference_seqwise_aux_loss(
-            scores_TE2, routing_map_TE2, self.K, 1.0, self.per_step_denominator
-        ).item()
-        self.assertAlmostEqual(
-            LoggedAuxLoss.group_acc[("batch", "seqwise_load_balance_loss")].item(),
-            single,
-            places=5,
-        )
-
-
 class TestSeqwiseLossSpmdTypes(DTensorTestBase):
-    """8-rank spmd_types test: per-forward loss and gradient match the
-    global per-DP-rank reference (CPU float64 + gloo), under
-    with and without the SPMD typechecker, and with EP token sharding on
-    and off."""
+    """8-rank spmd_types cases: dp2/cp2/tp2 on CPU float64 + gloo.
+
+    The loss is a whole-DP-local-forward statistic, so every rank must compute
+    the same value for a DP rank's token stream, and the collected metric must
+    sum the streams.  Both must hold with and without the typechecker.
+    """
 
     @property
     def world_size(self):
         return 8
 
-    def _setup_mesh(self, *, enable_ep: bool):
-        """Build parallel dims and register meshes.  Returns
-        (parallel_dims, dense_mesh).
-
-        ``enable_ep`` selects the expert-parallel mesh: with EP the loss
-        reduces the router output's token sums over CP and TP, without EP only
-        over CP (the router output is TP-replicate).  DP stays local either
-        way (one stream per DP rank)."""
-        from torchtitan.distributed.parallel_dims import ParallelDims
-        from torchtitan.distributed.spmd_types import set_spmd_meshes
-
-        _set_spmd_types_backend()
-        with patch("torchtitan.distributed.parallel_dims.device_type", "cpu"):
-            parallel_dims = ParallelDims(
-                dp_replicate=1,
-                dp_shard=2,
-                cp=2,
-                tp=2,
-                pp=1,
-                ep=2 if enable_ep else 1,
-                world_size=8,
-                spmd_backend="spmd_types",
-            )
-            parallel_dims.build_mesh()
-            dense_mesh = parallel_dims.get_mesh(["dp", "cp", "tp"])
-            set_spmd_meshes(
-                dense_mesh=dense_mesh,
-                sparse_mesh=parallel_dims.spmd_sparse_mesh(),
-            )
-        return parallel_dims, dense_mesh
-
-    def _make_loss_config(self, top_k: int):
-        LoggedAuxLoss.set_step_denominator(torch.tensor(1.0, dtype=torch.float64))
-        return SeqwiseLoadBalanceLoss.Config(coeff=0.1)
-
-    def _reference_for_stream(self, scores, ids, top_k, E, coeff=0.1):
-        """Reference loss and gradient for a single dp-rank token stream."""
-        with torch.no_grad():
-            routing_map = torch.zeros(scores.shape[0], E).scatter_(-1, ids, 1.0)
-            counts_E = routing_map.sum(dim=0)
-            probs = scores / scores.sum(dim=-1, keepdim=True)
-            prob_sums_E = probs.sum(dim=0)
-            num_tokens = scores.shape[0]
-            f_E = counts_E * (E / (top_k * num_tokens))
-            p_E = prob_sums_E / num_tokens
-            # Token-mode (sum-type) form: T times the Eqs 17-20 value.
-            ref_loss = (f_E * p_E).sum() * num_tokens
-        ref_scores = scores.detach().clone().requires_grad_(True)
-        rm = torch.zeros(scores.shape[0], E).scatter_(-1, ids, 1.0)
-        cts = rm.sum(dim=0)
-        prs = ref_scores / ref_scores.sum(dim=-1, keepdim=True)
-        nt = scores.shape[0]
-        f = cts * (E / (top_k * nt))
-        p = prs.sum(dim=0) / nt
-        ref_aux = (f * p).sum() * nt * coeff
-        ref_carrier = ref_scores.gather(dim=-1, index=ids)
-        (ref_aux + ref_carrier.sum()).backward()
-        return ref_loss, ref_scores.grad
-
-    def _setup_pp_mesh(self):
-        """Build pp=2 parallel dims (pp2 x dp2 x cp2 = 8 ranks)."""
+    def _build_dims(self, **overrides):
+        """ParallelDims on CPU; ``overrides`` replace the default dp2/cp2/tp2."""
         from torchtitan.distributed.parallel_dims import ParallelDims
 
         _set_spmd_types_backend()
+        kwargs = dict(
+            dp_replicate=1,
+            dp_shard=2,
+            cp=2,
+            tp=2,
+            pp=1,
+            ep=1,
+            world_size=8,
+            spmd_backend="spmd_types",
+        )
         with patch("torchtitan.distributed.parallel_dims.device_type", "cpu"):
-            parallel_dims = ParallelDims(
-                dp_replicate=1,
-                dp_shard=2,
-                cp=2,
-                tp=1,
-                pp=2,
-                ep=1,
-                world_size=8,
-                spmd_backend="spmd_types",
-            )
+            parallel_dims = ParallelDims(**{**kwargs, **overrides})
             parallel_dims.build_mesh()
         return parallel_dims
 
+    def _setup_mesh(self, *, enable_ep: bool):
+        """Register the meshes and return ``(parallel_dims, dense_mesh)``.
+
+        With EP the router output shards tokens over CP and TP; without EP it
+        is TP-replicate, so the loss reduces token sums over CP only.  DP stays
+        local either way: one stream per DP rank.
+        """
+        from torchtitan.distributed.spmd_types import set_spmd_meshes
+
+        parallel_dims = self._build_dims(ep=2 if enable_ep else 1)
+        dense_mesh = parallel_dims.get_mesh(["dp", "cp", "tp"])
+        set_spmd_meshes(
+            dense_mesh=dense_mesh, sparse_mesh=parallel_dims.spmd_sparse_mesh()
+        )
+        return parallel_dims, dense_mesh
+
     @with_comms
     def test_pp_reduction_sums_stages(self):
-        """The pp reduction sums stages instead of averaging them.
-
-        Every layer lives on exactly one pipeline stage, so summing the stage
-        partials and dividing by the build-time instance count (identical on
-        every rank) yields the mean over all layers.  Averaging stages would
-        under-report by the pipeline degree.
-        """
-        parallel_dims = self._setup_pp_mesh()
+        """collect_aux_loss_metrics sums the pipeline stages -- every layer
+        lives on exactly one stage -- and divides by the build-time instance
+        count, i.e. it reports the mean over layers.  Averaging the stages
+        instead would under-report by the pipeline degree."""
+        parallel_dims = self._build_dims(cp=2, tp=1, pp=2)
         _clear_aux_loss_registry()
-        key = ("batch", "seqwise_load_balance_loss")
-        # Emulate one rank: the build-time count is 6 instances (the divisor),
-        # and this rank's per-step values sum to 3.0.
-        LoggedAuxLoss._group_counts[key] = 6
-        LoggedAuxLoss.group_acc[key] = torch.tensor(3.0, dtype=torch.float32)
+        # This rank: 6 instances built, 3.0 accumulated, 2 DP coords in the
+        # batch mesh; summing the 2 stages gives 12.0, divided by 6 gives 2.0.
+        LoggedAuxLoss._group_counts[_METRIC_KEY] = 6
+        LoggedAuxLoss.group_acc[_METRIC_KEY] = torch.tensor(3.0, dtype=torch.float32)
 
         metrics = collect_aux_loss_metrics(parallel_dims)
-        # Sum over the batch mesh (2 dp coords) -> 6.0 per stage, then sum
-        # over the pp mesh (2 stages) -> 12.0, divided by 6 -> 2.0.
-        # Averaging over pp would report 1.0.
-        self.assertAlmostEqual(metrics["seqwise_load_balance_loss/mean"], 2.0, places=6)
+        self.assertAlmostEqual(metrics[f"{_METRIC_KEY[1]}/mean"], 2.0, places=6)
         _clear_aux_loss_registry()
 
     def _run_reduction_case(self, *, enable_ep: bool, use_typecheck: bool):
-        """Run one distributed reduction case and compare with the reference.
-
-        The loss derives its token-partition axes from runtime mesh state, so
-        the same assertions must hold with and without the SPMD typechecker
-        (the default training configuration has it off).
-        """
+        """Compare one distributed layout with the per-DP-rank reference."""
         parallel_dims, dense_mesh = self._setup_mesh(enable_ep=enable_ep)
         from torchtitan.distributed.spmd_types import set_current_spmd_mesh
 
-        T, E, K = 128, 8, 2
-        dp, cp, tp = 2, 2, 2
+        T, E, K, dp, cp, tp = 128, 8, 2, 2, 2, 2
         dp_rank = self.rank // (cp * tp)
         cp_rank = (self.rank // tp) % cp
         tp_rank = self.rank % tp
@@ -435,97 +307,89 @@ class TestSeqwiseLossSpmdTypes(DTensorTestBase):
                 dense_sequence_parallel_placement,
             )
 
-            t_blk = t_dp // (cp * tp)
-            shard = cp_rank * tp + tp_rank
-            t_start = dp_start + shard * t_blk
-            t_end = t_start + t_blk
+            shard, t_blk = cp_rank * tp + tp_rank, t_dp // (cp * tp)
             placement = dense_sequence_parallel_placement()
         else:
             from torchtitan.models.common.decoder_sharding import (
                 dense_activation_placement,
             )
 
-            t_blk = t_dp // cp
-            shard = cp_rank
-            t_start = dp_start + shard * t_blk
-            t_end = t_start + t_blk
+            shard, t_blk = cp_rank, t_dp // cp
             placement = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+        t_start = dp_start + shard * t_blk
 
         checker = typecheck(local=False) if use_typecheck else contextlib.nullcontext()
         _clear_aux_loss_registry()
         with set_current_spmd_mesh(dense_mesh), checker:
             torch.manual_seed(0)
-            global_scores = torch.rand(T, E, dtype=torch.float64)
+            global_scores_TE = torch.rand(T, E, dtype=torch.float64)
             with spmd.no_typecheck():
-                # Distinct ids per token, like torch.topk in the router, so
-                # each token contributes exactly K one-hot entries.
-                global_ids = torch.topk(torch.rand(T, E), k=K, dim=-1).indices
-                local_scores = global_scores[t_start:t_end].contiguous()
-                local_ids = global_ids[t_start:t_end].contiguous()
-                local_routing_map = torch.zeros(
-                    local_ids.shape[0], E, dtype=torch.bool
-                ).scatter_(-1, local_ids, True)
+                # Distinct ids per token, like torch.topk in the router, so each
+                # token contributes exactly K one-hot entries.
+                global_ids_TK = torch.topk(torch.rand(T, E), k=K, dim=-1).indices
+                local_scores = global_scores_TE[t_start : t_start + t_blk].contiguous()
+                local_ids_TK = global_ids_TK[t_start : t_start + t_blk].contiguous()
+                local_map = _routing_map(local_ids_TK, E)
 
             spmd.assert_type(local_scores, placement)
-            spmd.assert_type(local_ids, placement)
-            spmd.assert_type(local_routing_map, placement)
+            spmd.assert_type(local_ids_TK, placement)
+            spmd.assert_type(local_map, placement)
 
-            loss = SeqwiseLoadBalanceLoss(self._make_loss_config(K))
-
+            # Denominator 1, so the register holds the raw token-mode value.
+            LoggedAuxLoss.set_step_denominator(torch.tensor(1.0, dtype=torch.float64))
+            loss = SeqwiseLoadBalanceLoss(SeqwiseLoadBalanceLoss.Config(coeff=_COEFF))
             local_scores.requires_grad_(True)
-            carrier = local_scores.gather(dim=-1, index=local_ids)
-            out = loss(local_scores, local_routing_map, carrier=carrier)
-            with spmd.no_typecheck():
-                torch.testing.assert_close(out, carrier, rtol=0, atol=0)
-                # Backward runs outside the checker in both modes: with EP off
-                # the final statistics are Replicate on tp (no tp token
-                # sharding), which the checker rejects for implicit backward.
-                out.sum().backward()
+            carrier_TK = local_scores.gather(dim=-1, index=local_ids_TK)
+            out_TK = loss(local_scores, local_map, carrier=carrier_TK)
 
             with spmd.no_typecheck():
-                dp_scores = global_scores[dp_start : dp_start + t_dp]
-                dp_ids = global_ids[dp_start : dp_start + t_dp]
-                ref_loss, ref_grad = self._reference_for_stream(dp_scores, dp_ids, K, E)
-                # The metric accumulator is float32 (the reference is float64).
-                self.assertAlmostEqual(
-                    loss.instance_acc.item(), ref_loss.item(), places=4
-                )
-                ref_local_grad = ref_grad[shard * t_blk : (shard + 1) * t_blk]
+                torch.testing.assert_close(out_TK, carrier_TK, rtol=0, atol=0)
+                # Backward runs outside the checker in both modes: with EP off
+                # the statistics are TP-Replicate, which the checker rejects
+                # for implicit backward.
+                out_TK.sum().backward()
+
+                dp_scores = global_scores_TE[dp_start : dp_start + t_dp]
+                dp_ids_TK = global_ids_TK[dp_start : dp_start + t_dp]
+                dp_map = _routing_map(dp_ids_TK, E)
+                # The metric accumulator is float32 (the reference float64).
+                ref_raw = _reference_loss(dp_scores, dp_map, K).item()
+                self.assertAlmostEqual(loss.instance_acc.item(), ref_raw, places=4)
+
+                ref_scores = dp_scores.detach().clone().requires_grad_(True)
+                ref_aux = _reference_loss(ref_scores, dp_map, K, coeff=_COEFF)
+                (ref_aux + (ref_scores * dp_map).sum()).backward()
+                ref_local_grad = ref_scores.grad[shard * t_blk : (shard + 1) * t_blk]
                 self.assertLess(
                     (local_scores.grad - ref_local_grad).abs().max().item(), 1e-10
                 )
 
-        # The collected metric sums the reduce mesh (each dp rank contributes
-        # its own stream), so with two dp ranks the value equals the sum of
-        # the two streams' losses -- the same step-global value a one-rank
-        # run processing both streams would produce (denominator = 1 here).
+        # The metric sums the reduce mesh, so it equals the sum over the DP
+        # ranks' streams -- the step-global value a single-rank run over both
+        # streams would produce (denominator 1 here).
         _zero_aux_losses([loss])
-        metrics = collect_aux_loss_metrics(parallel_dims)
         ref_total = 0.0
         for stream in range(dp):
-            s = global_scores[stream * t_dp : (stream + 1) * t_dp]
-            i = global_ids[stream * t_dp : (stream + 1) * t_dp]
-            ref_total += self._reference_for_stream(s, i, K, E)[0].item()
-        self.assertAlmostEqual(
-            metrics["seqwise_load_balance_loss/mean"], ref_total, places=4
-        )
+            stream_scores = global_scores_TE[stream * t_dp : (stream + 1) * t_dp]
+            stream_ids_TK = global_ids_TK[stream * t_dp : (stream + 1) * t_dp]
+            ref_total += _reference_loss(
+                stream_scores, _routing_map(stream_ids_TK, E), K
+            ).item()
+        metrics = collect_aux_loss_metrics(parallel_dims)
+        self.assertAlmostEqual(metrics[f"{_METRIC_KEY[1]}/mean"], ref_total, places=4)
         _clear_aux_loss_registry()
 
     @with_comms
-    def test_ep_enabled_reduction(self):
-        """EP/SP token sharding over TP: P->I on CP and TP; loss and gradient
-        match the per-DP-rank reference, with and without the typechecker."""
-        for use_typecheck in (True, False):
-            with self.subTest(use_typecheck=use_typecheck):
-                self._run_reduction_case(enable_ep=True, use_typecheck=use_typecheck)
-
-    @with_comms
-    def test_ep_disabled_reduction(self):
-        """No EP token sharding over TP: P->I on CP only; loss and gradient
-        match the per-DP-rank reference, with and without the typechecker."""
-        for use_typecheck in (True, False):
-            with self.subTest(use_typecheck=use_typecheck):
-                self._run_reduction_case(enable_ep=False, use_typecheck=use_typecheck)
+    def test_reduction_matches_reference(self):
+        """Loss, gradient and collected metric match the per-DP-rank reference:
+        P->I over CP and TP with EP, over CP alone without EP, each with and
+        without the typechecker."""
+        for enable_ep in (True, False):
+            for use_typecheck in (True, False):
+                with self.subTest(enable_ep=enable_ep, use_typecheck=use_typecheck):
+                    self._run_reduction_case(
+                        enable_ep=enable_ep, use_typecheck=use_typecheck
+                    )
 
 
 if __name__ == "__main__":
