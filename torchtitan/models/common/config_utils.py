@@ -448,6 +448,7 @@ def make_routed_experts_config(
     non_blocking_capacity_factor: float | None = None,
     num_max_tokens_per_rank: int | None = None,
     cudagraphable: bool = False,
+    swiglu_limit: float = 0.0,
 ) -> RoutedExperts.Config:
     """Build a fully-specified RoutedExperts.Config (inner_experts + token_dispatcher)."""
     return RoutedExperts.Config(
@@ -456,6 +457,7 @@ def make_routed_experts_config(
             hidden_dim=hidden_dim,
             num_experts=num_experts,
             param_init=param_init,
+            swiglu_limit=swiglu_limit,
         ),
         token_dispatcher=make_token_dispatcher_config(
             num_experts=num_experts,

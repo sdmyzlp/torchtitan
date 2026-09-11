@@ -374,6 +374,7 @@ def _build_layers(
     num_shared_experts: int,
     top_k: int,
     route_scale: float,
+    swiglu_limit: float,
     load_balance_coeff: float,
     hc_mult: int,
     sinkhorn_iters: int,
@@ -404,6 +405,7 @@ def _build_layers(
                 top_k=top_k,
                 param_init=_EXPERTS_INIT,
                 comm_backend="standard",
+                swiglu_limit=swiglu_limit,
             ),
             shared_experts=(
                 make_ffn_config(
@@ -513,6 +515,8 @@ def _debugmodel(
     num_shared_experts = 1
     top_k = 2
     route_scale = 1.5
+    # The report's SwiGLU clamp; it keeps the expert activations in fp8/fp4 range.
+    swiglu_limit = 10.0
     load_balance_coeff = 1e-3
     hc_mult = 4
     sinkhorn_iters = 3
@@ -566,6 +570,7 @@ def _debugmodel(
         num_shared_experts=num_shared_experts,
         top_k=top_k,
         route_scale=route_scale,
+        swiglu_limit=swiglu_limit,
         load_balance_coeff=load_balance_coeff,
         hc_mult=hc_mult,
         sinkhorn_iters=sinkhorn_iters,
