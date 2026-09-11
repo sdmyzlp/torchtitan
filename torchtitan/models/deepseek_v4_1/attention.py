@@ -29,10 +29,11 @@ them and injects the gradient on its output.
 from dataclasses import dataclass
 
 import torch
+from torch import nn
 
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.aux_loss import AuxLoss
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import BatchedLinear, Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.protocols.module import Module
@@ -207,9 +208,8 @@ class Attention(BaseAttention):
         wq_b: Linear.Config
         wkv: Linear.Config
         kv_norm: RMSNorm.Config
-        wo_a: Linear.Config
+        wo_a: BatchedLinear.Config
         wo_b: Linear.Config
-        attn_sink: Linear.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -230,9 +230,8 @@ class Attention(BaseAttention):
         self.kv_norm = config.kv_norm.build()
         self.wo_a = config.wo_a.build()
         self.wo_b = config.wo_b.build()
-        # Holds one sink logit per head; the forward squeezes the trailing dim, matching
-        # the parameter's meaning in the checkpoint.
-        self.attn_sink = config.attn_sink.build()
+        # One sink logit per head, fp32 as in the released checkpoint and the kernels.
+        self.attn_sink = nn.Parameter(torch.empty(config.n_heads, dtype=torch.float32))
         self.compressor = config.compressor.build()
         self.indexer = config.indexer.build()
         self.inner_attention = config.inner_attention.build()
@@ -286,21 +285,19 @@ class Attention(BaseAttention):
         o_THD = self.inner_attention(
             q_THD,
             swa_k_TD,
-            self.attn_sink.weight.squeeze(-1),
+            self.attn_sink,
             cmp_k=cmp_k if uses_cmp else None,
             topk_indices=topk_indices if uses_cmp else None,
             topk_scores=topk_scores if uses_cmp else None,
         )
         o_THD = self.rope(o_THD, positions=positions_T, inverse=True)
 
-        # wo_a is block-diagonal over groups: each group projects only its own heads.
-        n_local_heads = o_THD.size(1)
-        n_local_groups = self.n_groups // (self.n_heads // n_local_heads)
-        o_TGD = o_THD.view(num_tokens, n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-        o_TGR = torch.einsum("tgd,grd->tgr", o_TGD, wo_a)
+        # The output projection is grouped: wo_a projects each query-head group on its
+        # own, wo_b mixes the per-group results back to the model dimension. The group
+        # count comes from the module so a group-wise sharding can narrow it later.
+        o_TGR = self.wo_a(o_THD.view(num_tokens, self.wo_a.n_batches, -1))
         return (
-            self.wo_b(o_TGR.reshape(num_tokens, -1)),
+            self.wo_b(o_TGR.flatten(-2)),
             cmp_k,
             idx_k,
             topk_indices,

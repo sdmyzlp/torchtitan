@@ -147,7 +147,49 @@ class ScaledBiasRowwiseLinear(Linear):
         return F.linear(input, weight, bias)
 
 
+class BatchedLinear(Module):
+    """Linear applied independently to each slice of the last input dimension.
+
+    Some projections are block-diagonal over a group axis rather than dense: attention
+    output projections that keep each query-head group separate, for instance. Expressing
+    that with one dense ``Linear`` plus a ``view``/``einsum`` at the call site hides the
+    group structure, which is what any group-wise sharding or fused kernel needs to see.
+
+    Shape legend: T = tokens, B = batches/groups, I = ``in_features``,
+    O = ``out_features``.
+
+    Input is ``[T, B, I]`` and weight is ``[B, O, I]``; output is ``[T, B, O]``.
+
+    TODO: the placement of the per-group weight under ``spmd_types`` is not settled --
+    a group-wise projection may need cross-group communication once the group axis and
+    the tensor-parallel axis disagree, see the review on #3634. Its only user today
+    (DeepSeek-V4.1) rejects tensor parallelism, so the sharding story can be worked out
+    before this module is used on a sharded group axis.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        n_batches: int
+        in_features: int
+        out_features: int
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.n_batches = config.n_batches
+        self.in_features = config.in_features
+        self.out_features = config.out_features
+        self.weight = nn.Parameter(
+            torch.empty(config.n_batches, config.out_features, config.in_features)
+        )
+
+    def forward(self, x_TBI: torch.Tensor) -> torch.Tensor:
+        # Batched matmul with B as the batch dimension: [B, T, I] x [B, I, O] -> [B, T, O].
+        out_TBO = (x_TBI.transpose(0, 1) @ self.weight.transpose(-1, -2)).transpose(0, 1)
+        return out_TBO
+
+
 __all__ = [
+    "BatchedLinear",
     "Linear",
     "RouterGateLinear",
     "ScaledBiasRowwiseLinear",

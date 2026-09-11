@@ -12,6 +12,7 @@ import torch.nn as nn
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
+    BatchedLinear,
     ComplexRoPE,
     Embedding,
     Linear,
@@ -328,10 +329,10 @@ def _make_attention_config(
         kv_norm=RMSNorm.Config(
             normalized_shape=head_dim, eps=norm_eps, param_init=_NORM_INIT
         ),
-        wo_a=Linear.Config(
+        wo_a=BatchedLinear.Config(
+            n_batches=n_groups,
             in_features=n_heads * head_dim // n_groups,
-            out_features=n_groups * o_lora_rank,
-            bias=False,
+            out_features=o_lora_rank,
             param_init=_LINEAR_INIT,
         ),
         wo_b=Linear.Config(
@@ -340,12 +341,7 @@ def _make_attention_config(
             bias=False,
             param_init=_LINEAR_INIT,
         ),
-        attn_sink=Linear.Config(
-            in_features=1,
-            out_features=n_heads,
-            bias=False,
-            param_init=_LINEAR_INIT,
-        ),
+        param_init={"attn_sink": partial(nn.init.trunc_normal_, std=0.02)},
     )
 
 
