@@ -237,24 +237,6 @@ class Attention(BaseAttention):
         self.indexer = config.indexer.build()
         self.inner_attention = config.inner_attention.build()
 
-    def _rotate_tail(
-        self,
-        x_TND: torch.Tensor,
-        positions_T: torch.Tensor,
-        *,
-        inverse: bool = False,
-    ) -> torch.Tensor:
-        """Rotate the trailing rope slice, accepting ``[.., Dk]`` tensors."""
-        rd = self.rope_head_dim
-        nope_TNn, rope_TNr = x_TND.split([self.head_dim - rd, rd], dim=-1)
-        squeeze = rope_TNr.dim() == 2
-        if squeeze:
-            rope_TNr = rope_TNr.unsqueeze(1)
-        rope_TNr = self.rope(rope_TNr, positions=positions_T, inverse=inverse)
-        if squeeze:
-            rope_TNr = rope_TNr.squeeze(1)
-        return torch.cat([nope_TNn, rope_TNr], dim=-1)
-
     def forward(
         self,
         x_TD: torch.Tensor,
@@ -296,8 +278,9 @@ class Attention(BaseAttention):
             candidates_TN=candidates,
         )
 
-        q_THD = self._rotate_tail(q_THD, positions_T)
-        swa_k_TD = self._rotate_tail(swa_k_TD, positions_T)
+        q_THD = self.rope(q_THD, positions=positions_T)
+        # The shared KV latent is one rank-2 head; RoPE rotates rank-3 [T, N, H].
+        swa_k_TD = self.rope(swa_k_TD.unsqueeze(1), positions=positions_T).squeeze(1)
 
         uses_cmp = self.compress_ratio > 0
         o_THD = self.inner_attention(
@@ -308,7 +291,7 @@ class Attention(BaseAttention):
             topk_indices=topk_indices if uses_cmp else None,
             topk_scores=topk_scores if uses_cmp else None,
         )
-        o_THD = self._rotate_tail(o_THD, positions_T, inverse=True)
+        o_THD = self.rope(o_THD, positions=positions_T, inverse=True)
 
         # wo_a is block-diagonal over groups: each group projects only its own heads.
         n_local_heads = o_THD.size(1)

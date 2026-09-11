@@ -78,15 +78,6 @@ class Compressor(Module):
         self.norm = config.norm.build()
         self.rope = config.rope.build()
 
-    def _rotate(self, latent_TD: torch.Tensor, positions_T: torch.Tensor) -> torch.Tensor:
-        """Rotate the rope slice of each entry at its group's first-token position."""
-        rd = self.rope_head_dim
-        nope_TDr, rope_TDr = latent_TD.split([self.head_dim - rd, rd], dim=-1)
-        rope_TDr = self.rope(
-            rope_TDr.unsqueeze(1), positions=positions_T[:: self.compress_ratio]
-        ).squeeze(1)
-        return torch.cat([nope_TDr, rope_TDr], dim=-1)
-
     def forward(
         self,
         x_TD: torch.Tensor,
@@ -135,4 +126,9 @@ class Compressor(Module):
             ).sum(dim=1)
             latent_TD = self.norm(pooled_TD.to(x_TD.dtype))
 
-        return self._rotate(latent_TD, positions_T), latent_TD
+        # Entry j stands for the group starting at token j * R, so it rotates at that
+        # token's position. The latent is one rank-2 head; RoPE rotates rank-3 [T, N, H].
+        rotated_TD = self.rope(
+            latent_TD.unsqueeze(1), positions=positions_T[:: self.compress_ratio]
+        ).squeeze(1)
+        return rotated_TD, latent_TD

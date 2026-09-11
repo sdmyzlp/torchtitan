@@ -91,6 +91,9 @@ class RoPE(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
+        # Width of the rotated slice, and of the cache built from it. The tensor handed
+        # to ``forward`` is ``split + dim`` wide: the leading ``split`` channels are
+        # left alone and the remaining ``dim`` are rotated.
         dim: int
         max_context_length: int
         theta: float = 10000.0
@@ -100,6 +103,11 @@ class RoPE(Module):
         low_freq_factor: float = 1.0
         high_freq_factor: float = 4.0
         original_max_position_embeddings: int = 8192
+        # Number of leading channels left un-rotated, for layouts that keep a
+        # positional slice behind a non-positional one (e.g. MLA's ``[nope | rope]``).
+        # 0 rotates the whole tensor. Fixed per site, so the split is part of the
+        # module's contract rather than a per-call decision.
+        split: int = 0
         # yarn scaling params
         rope_factor: float = 1.0
         beta_fast: float = 32.0
@@ -110,6 +118,7 @@ class RoPE(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        self.split = config.split
         self.register_buffer("cache", self._precompute_cache(), persistent=False)
 
     def _precompute_cache(self) -> torch.Tensor:
@@ -144,7 +153,7 @@ class RoPE(Module):
         *,
         inverse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Apply a prepared RoPE cache to query and optional key.
+        """Rotate the full ``query`` (and optional ``key``) with a prepared cache.
 
         Args:
             query: Query tensor with shape ``[T, N, H]``.
@@ -154,11 +163,32 @@ class RoPE(Module):
                 according to the concrete RoPE format.
             inverse: Whether to apply the inverse rotation.
 
+        Callers that keep a positional-free prefix out of the rotation (MLA's
+        ``[nope | rope]``) slice it off in ``forward`` and hand the trailing channels
+        here, so the formats never see the prefix and the cache stays as wide as the
+        rotated slice.
+
         Returns:
             Rotated query tensor when ``key`` is ``None``; otherwise rotated
             query and key tensors with the same shapes and dtypes as inputs.
         """
         raise NotImplementedError
+
+    def _split(self, x: torch.Tensor | None) -> torch.Tensor | None:
+        """Return the channels of ``x`` to rotate: everything after the ``split`` prefix.
+
+        A ``None`` tensor (an absent key) and an unset ``split`` pass through unchanged,
+        so query and key can be handed over unconditionally.
+        """
+        if x is None or not self.split:
+            return x
+        return x[..., self.split :]
+
+    def _unsplit(self, rotated: torch.Tensor, x: torch.Tensor | None) -> torch.Tensor:
+        """Put the untouched prefix of ``x`` back in front of its ``rotated`` channels."""
+        if x is None or not self.split:
+            return rotated
+        return torch.cat([x[..., : self.split], rotated], dim=-1)
 
     def forward(
         self,
@@ -168,9 +198,21 @@ class RoPE(Module):
         *,
         inverse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Apply rotary embeddings to query and optional key tensors."""
-        reshaped_cache = self._reshape_cache(query, positions)
-        return self.apply_rotary_emb(query, key, reshaped_cache, inverse=inverse)
+        """Apply rotary embeddings to query and optional key tensors.
+
+        With a non-zero ``split`` the leading ``split`` channels are left untouched:
+        the trailing ``dim`` channels are rotated and the prefix is concatenated back,
+        so ``apply_rotary_emb`` only ever sees the rotated slice. Query and key are
+        rank-3 ``[T, N, H]``; a rank-2 shared latent is unsqueezed by the caller.
+        """
+        rope_cache = self._reshape_cache(query, positions)
+        rotated = self.apply_rotary_emb(
+            self._split(query), self._split(key), rope_cache, inverse=inverse
+        )
+        if key is None:
+            return self._unsplit(rotated, query)
+        rotated_query, rotated_key = rotated
+        return self._unsplit(rotated_query, query), self._unsplit(rotated_key, key)
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         # TODO: In long-term we need to have buffer abstraction in `Module`` class to infer the buffer_device

@@ -155,20 +155,6 @@ class Indexer(Module):
             self.wk = config.wk.build()
             self.k_norm = config.k_norm.build()
 
-    def _rotate_tail(
-        self, x_TND: torch.Tensor, positions_T: torch.Tensor
-    ) -> torch.Tensor:
-        """Rotate the trailing rope slice, accepting ``[.., Di]`` tensors."""
-        rd = self.rope_head_dim
-        nope_TNn, rope_TNr = x_TND.split([self.index_head_dim - rd, rd], dim=-1)
-        squeeze = rope_TNr.dim() == 2
-        if squeeze:
-            rope_TNr = rope_TNr.unsqueeze(1)
-        rope_TNr = self.rope(rope_TNr, positions=positions_T)
-        if squeeze:
-            rope_TNr = rope_TNr.squeeze(1)
-        return torch.cat([nope_TNn, rope_TNr], dim=-1)
-
     def _selected_scores(
         self,
         idx_q_THiDi: torch.Tensor,
@@ -257,14 +243,15 @@ class Indexer(Module):
         num_tokens = x_TD.size(0)
         hi, di = self.index_n_heads, self.index_head_dim
 
-        idx_q_THiDi = self._rotate_tail(
-            self.wq_b(qr_TQ).unflatten(-1, (hi, di)), positions_T
+        idx_q_THiDi = self.rope(
+            self.wq_b(qr_TQ).unflatten(-1, (hi, di)), positions=positions_T
         )
         if self.owns_k:
             idx_k_NDi = self.k_norm(self.wk(latent_TDp.detach()))
-            idx_k_NDi = self._rotate_tail(
-                idx_k_NDi, positions_T[:: self.compress_ratio]
-            )
+            # One rank-2 head; RoPE rotates rank-3 [T, N, H].
+            idx_k_NDi = self.rope(
+                idx_k_NDi.unsqueeze(1), positions=positions_T[:: self.compress_ratio]
+            ).squeeze(1)
         else:
             idx_k_NDi = idx_k_TpDi
         num_cmp = idx_k_NDi.size(0)

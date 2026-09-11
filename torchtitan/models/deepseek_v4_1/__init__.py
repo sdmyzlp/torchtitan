@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import copy
 from collections.abc import Callable
 from functools import partial
 
@@ -75,6 +74,47 @@ def _output_linear_init(dim: int) -> dict[str, Callable]:
     }
 
 
+def _make_rope_config(
+    *,
+    rope_head_dim: int,
+    max_context_length: int,
+    split: int,
+    compressed: bool,
+    rope_theta: float,
+    compress_rope_theta: float,
+    rope_factor: float,
+    beta_fast: float,
+    beta_slow: float,
+    original_seq_len: int,
+) -> ComplexRoPE.Config:
+    """RoPE config for one site.
+
+    Layers that compress rotate at a larger base because one entry spans several
+    tokens, so its positions are further apart; sliding-window-only layers keep the
+    plain base. Every site builds its own config, which is also what gives each of
+    them its own cache buffer.
+    """
+    if not compressed:
+        return ComplexRoPE.Config(
+            dim=rope_head_dim,
+            max_context_length=max_context_length,
+            theta=rope_theta,
+            scaling="none",
+            split=split,
+        )
+    return ComplexRoPE.Config(
+        dim=rope_head_dim,
+        max_context_length=max_context_length,
+        theta=compress_rope_theta,
+        scaling="yarn",
+        rope_factor=rope_factor,
+        beta_fast=beta_fast,
+        beta_slow=beta_slow,
+        original_seq_len=original_seq_len,
+        split=split,
+    )
+
+
 def _served_group_sizes(
     *,
     n_layers: int,
@@ -115,8 +155,7 @@ def _make_attention_config(
     index_topk: int,
     kv_source_layers: tuple[int, ...],
     index_source_layers: tuple[int, ...],
-    rope: ComplexRoPE.Config,
-    rope_compress: ComplexRoPE.Config,
+    make_rope: Callable[[bool, int], ComplexRoPE.Config],
     use_candidates: bool,
     candidate_source_layer: int,
     candidate_topk_blocks: int,
@@ -139,9 +178,10 @@ def _make_attention_config(
             f"layer {layer_id} is not in kv_source_layers."
         )
 
-    # Layers with a compressed main KV rotate at the compressed base, which is what
-    # keeps the pooled entries' position spacing meaningful.
-    layer_rope = rope_compress if compress_ratio > 0 else rope
+    compresses = compress_ratio > 0
+    # The attention and its compressor rotate the KV head, the indexer its own head.
+    rope_split = head_dim - rope_head_dim
+    index_rope_split = index_head_dim - rope_head_dim
 
     compressor = Compressor.Config(
         dim=dim,
@@ -149,7 +189,7 @@ def _make_attention_config(
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
         is_source=owns_k,
-        rope=copy.deepcopy(layer_rope) if owns_k else None,
+        rope=make_rope(compresses, rope_split) if owns_k else None,
         wkv=(
             Linear.Config(
                 in_features=dim,
@@ -194,7 +234,7 @@ def _make_attention_config(
         uses_candidates=uses_candidates,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
-        rope=copy.deepcopy(layer_rope) if is_index_source else None,
+        rope=make_rope(compresses, index_rope_split) if is_index_source else None,
         wq_b=(
             Linear.Config(
                 in_features=q_lora_rank,
@@ -261,7 +301,7 @@ def _make_attention_config(
             softmax_scale=head_dim**-0.5,
             aux_loss=aux_loss,
         ),
-        rope=copy.deepcopy(layer_rope),
+        rope=make_rope(compresses, rope_split),
         compressor=compressor,
         indexer=indexer,
         wq_a=Linear.Config(
@@ -327,8 +367,7 @@ def _build_layers(
     index_topk: int,
     kv_source_layers: tuple[int, ...],
     index_source_layers: tuple[int, ...],
-    rope: ComplexRoPE.Config,
-    rope_compress: ComplexRoPE.Config,
+    make_rope: Callable[[bool, int], ComplexRoPE.Config],
     use_candidates: bool,
     candidate_source_layer: int,
     candidate_topk_blocks: int,
@@ -402,8 +441,7 @@ def _build_layers(
                     index_topk=index_topk,
                     kv_source_layers=kv_source_layers,
                     index_source_layers=index_source_layers,
-                    rope=rope,
-                    rope_compress=rope_compress,
+                    make_rope=make_rope,
                     use_candidates=use_candidates,
                     candidate_source_layer=candidate_source_layer,
                     candidate_topk_blocks=candidate_topk_blocks,
@@ -483,25 +521,26 @@ def _debugmodel(
     hc_mult = 4
     sinkhorn_iters = 3
     hc_eps = 1e-6
+    rope_theta = 10000.0
     compress_rope_theta = 160000.0
+    rope_factor = 16.0
+    beta_fast = 32.0
+    beta_slow = 1.0
     original_seq_len = 65536
 
-    rope = ComplexRoPE.Config(
-        dim=rope_head_dim,
-        max_context_length=seq_len,
-        theta=10000.0,
-        scaling="none",
-    )
-    rope_compress = ComplexRoPE.Config(
-        dim=rope_head_dim,
-        max_context_length=seq_len,
-        theta=compress_rope_theta,
-        scaling="yarn",
-        rope_factor=16.0,
-        beta_fast=32.0,
-        beta_slow=1.0,
-        original_seq_len=original_seq_len,
-    )
+    def make_rope(compressed: bool, split: int) -> ComplexRoPE.Config:
+        return _make_rope_config(
+            rope_head_dim=rope_head_dim,
+            max_context_length=seq_len,
+            split=split,
+            compressed=compressed,
+            rope_theta=rope_theta,
+            compress_rope_theta=compress_rope_theta,
+            rope_factor=rope_factor,
+            beta_fast=beta_fast,
+            beta_slow=beta_slow,
+            original_seq_len=original_seq_len,
+        )
 
     layers = _build_layers(
         n_layers=n_layers,
@@ -520,8 +559,7 @@ def _debugmodel(
         index_topk=index_topk,
         kv_source_layers=kv_source_layers,
         index_source_layers=index_source_layers,
-        rope=rope,
-        rope_compress=rope_compress,
+        make_rope=make_rope,
         use_candidates=use_candidates,
         candidate_source_layer=candidate_source_layer,
         candidate_topk_blocks=candidate_topk_blocks,
