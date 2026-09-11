@@ -8,6 +8,7 @@ _supported_models = frozenset(
     [
         "deepseek_v3",
         "deepseek_v4",
+        "deepseek_v4_1",
         "flux",
         "gpt_oss",
         "kimi_k2_7",
