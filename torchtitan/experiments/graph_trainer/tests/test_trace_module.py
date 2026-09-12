@@ -259,11 +259,9 @@ class TestMinimalFXTracerDynamicShapes(unittest.TestCase):
         )
 
         def forward(x, xq, xk, freqs_cis, rope_cache, positions):
-            complex_cache = _reshape_for_broadcast(
-                freqs_cis, (*x.shape[:-1], x.shape[-1] // 2), positions
-            )
+            complex_cache = _reshape_for_broadcast(freqs_cis, x.shape[0], positions)
             single, _ = ComplexRoPE.apply_rotary_emb(x, x, complex_cache)
-            cos_sin_cache = _reshape_for_broadcast(rope_cache, xq.shape, positions)
+            cos_sin_cache = _reshape_for_broadcast(rope_cache, xq.shape[0], positions)
             q, k = CosSinRoPE.apply_rotary_emb(xq, xk, cos_sin_cache)
             return single + q + k
 
@@ -303,7 +301,7 @@ class TestMinimalFXTracerDynamicShapes(unittest.TestCase):
         from torchtitan.models.common.rope import _reshape_for_broadcast, CosSinRoPE
 
         def forward(xq, xk, rope_cache, positions):
-            cos_sin_cache = _reshape_for_broadcast(rope_cache, xq.shape, positions)
+            cos_sin_cache = _reshape_for_broadcast(rope_cache, xq.shape[0], positions)
             q, k = CosSinRoPE.apply_rotary_emb(xq, xk, cos_sin_cache)
             return q + k
 
@@ -336,7 +334,7 @@ class TestMinimalFXTracerDynamicShapes(unittest.TestCase):
 
         @torch.compile(backend="eager", fullgraph=True, dynamic=True)
         def forward(xq, rope_cache, positions):
-            return _reshape_for_broadcast(rope_cache, xq.shape, positions)
+            return _reshape_for_broadcast(rope_cache, xq.shape[0], positions)
 
         num_tokens, head_dim = 5, 8
         xq = torch.randn(num_tokens, 1, head_dim)
@@ -346,7 +344,7 @@ class TestMinimalFXTracerDynamicShapes(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 forward(xq, rope_cache, positions),
-                _reshape_for_broadcast(rope_cache, xq.shape, positions),
+                _reshape_for_broadcast(rope_cache, xq.shape[0], positions),
             )
         )
 

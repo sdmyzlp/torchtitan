@@ -103,17 +103,15 @@ class RoPE(Module):
         low_freq_factor: float = 1.0
         high_freq_factor: float = 4.0
         original_max_position_embeddings: int = 8192
-        # Number of leading channels left un-rotated, for layouts that keep a
-        # positional slice behind a non-positional one (e.g. MLA's ``[nope | rope]``).
-        # 0 rotates the whole tensor. Fixed per site, so the split is part of the
-        # module's contract rather than a per-call decision.
-        split: int = 0
         # yarn scaling params
         rope_factor: float = 1.0
         beta_fast: float = 32.0
         beta_slow: float = 1.0
         original_seq_len: int = 4096
         truncate: bool = True
+        # Number of leading channels left un-rotated, for layouts that keep a
+        # positional slice behind a non-positional one (e.g. MLA's ``[nope | rope]``).
+        split: int = 0
 
     def __init__(self, config: Config):
         super().__init__()
@@ -293,10 +291,7 @@ class ComplexRoPE(RoPE):
         positions = _maybe_wrap_positions(positions, query)
         if positions is not None:
             _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
-        # Complex RoPE cache has width dim / 2 because each complex value
-        # represents a pair of real dimensions.
-        complex_query_shape = (*query.shape[:-1], query.shape[-1] // 2)
-        return _reshape_for_broadcast(self.cache, complex_query_shape, positions)
+        return _reshape_for_broadcast(self.cache, query.shape[0], positions)
 
     @staticmethod
     def apply_rotary_emb(
@@ -377,7 +372,7 @@ class CosSinRoPE(RoPE):
         positions = _maybe_wrap_positions(positions, query)
         if positions is not None:
             _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
-        return _reshape_for_broadcast(self.cache, query.shape, positions)
+        return _reshape_for_broadcast(self.cache, query.shape[0], positions)
 
     @staticmethod
     def apply_rotary_emb(
@@ -418,18 +413,25 @@ class CosSinRoPE(RoPE):
 )
 def _reshape_for_broadcast(
     rope_cache: torch.Tensor,
-    query_shape: torch.Size | tuple[int, ...],
+    num_tokens: int,
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reshape a RoPE cache for broadcasting with query/key tensors."""
-    # cache_width is `head_dim * 2` for CosSinRoPE, and `head_dim // 2` for ComplexRoPE
-    cache_width = rope_cache.shape[-1]
-    num_tokens = query_shape[0]
+    """Gather ``rope_cache`` at ``positions`` and view it for query/key broadcast.
+
+    Only the token count is needed, not the query shape: the cache width comes from
+    the cache itself (``head_dim * 2`` for CosSinRoPE, ``head_dim // 2`` for
+    ComplexRoPE) and the view broadcasts over the head dim, which is what makes this
+    a ``[T, 1, width]`` reshape in the ``[T, N, H]`` layout the models use.
+
+    ``num_tokens`` is the local token count, shortened by context parallelism. It is
+    what the cache is trimmed to when no positions are given, since the cache is then
+    consumed from position 0.
+    """
     if positions is None:
         rope_cache = rope_cache[:num_tokens]
     else:
         rope_cache = rope_cache[positions]
-    return rope_cache.view(num_tokens, 1, cache_width)
+    return rope_cache.view(rope_cache.shape[0], 1, rope_cache.shape[-1])
 
 
 def _maybe_wrap_positions(
