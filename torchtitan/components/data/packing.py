@@ -13,9 +13,12 @@ from typing import Any
 import grain.python as grain
 import numpy as np
 
-from torchtitan.components.data.dataset import DatasetConfig, TextSequence
+from torchtitan.components.data.dataset import DatasetConfig, GrainDataset, TextSequence
 from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
 from torchtitan.components.loss import IGNORE_INDEX
+
+# The id both packers use for their own row padding.
+_PAD_ID = 0
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -23,6 +26,11 @@ class ConcatThenSplitPackingConfig:
     """Concatenates documents, chunking them into fixed-length rows."""
 
     dataset: DatasetConfig
+    pad_segments_to_multiple: int = 1
+    """Pad every document segment to this multiple before packing, ``1`` for none.
+
+    Consumers that pool ``k`` consecutive tokens (deeply compressed attention) need
+    segment boundaries to stay on multiples of ``k``."""
 
     def build(
         self,
@@ -30,7 +38,9 @@ class ConcatThenSplitPackingConfig:
         context: DatasetBuildContext,
         dataset_iteration_policy: DatasetIterationPolicy,
     ) -> grain.IterDataset:
-        dataset = self.dataset.build(
+        dataset = _aligned_source(
+            self.dataset,
+            multiple=self.pad_segments_to_multiple,
             context=context,
             dataset_iteration_policy=dataset_iteration_policy,
         )
@@ -228,6 +238,8 @@ class FirstFitPackingConfig:
     dataset: DatasetConfig
     num_packing_bins: int = 8
     """Candidate rows kept open; more bins can reduce padding but buffer more samples."""
+    pad_segments_to_multiple: int = 1
+    """Pad every document segment to this multiple before packing, ``1`` for none."""
 
     def __post_init__(self) -> None:
         if self.num_packing_bins <= 0:
@@ -239,7 +251,9 @@ class FirstFitPackingConfig:
         context: DatasetBuildContext,
         dataset_iteration_policy: DatasetIterationPolicy,
     ) -> grain.IterDataset:
-        dataset = self.dataset.build(
+        dataset = _aligned_source(
+            self.dataset,
+            multiple=self.pad_segments_to_multiple,
             context=context,
             dataset_iteration_policy=dataset_iteration_policy,
         )
@@ -351,6 +365,81 @@ def _next_document_chunk_end(
 def _packing_output_is_full(packing_output: dict[str, np.ndarray]) -> bool:
     """Return whether concat-then-split filled the entire token batch."""
     return bool(np.all(np.asarray(packing_output["input_ids_segment_ids"]) != 0))
+
+
+def _pad_segments_to_multiple(sequence: TextSequence, *, multiple: int) -> TextSequence:
+    """Append pad tokens so every position-reset segment is a multiple of ``multiple``.
+
+    Padding stays inside its segment: positions continue (``L, L+1, ...``) so the segment
+    does not split, the pads carry ``IGNORE_INDEX`` labels and a true ``padding_mask``,
+    and the ``positions == 0`` segment boundaries are unchanged. ``multiple == 1`` and an
+    empty sequence both fall out with nothing to pad.
+    """
+    num_tokens = len(sequence.input_ids)
+    positions = sequence.positions
+    if positions is None:
+        positions = np.arange(num_tokens, dtype=np.int64)
+
+    starts = np.flatnonzero(np.concatenate(([True], positions[1:] == 0)))
+    ends = np.append(starts[1:], num_tokens)
+    pad_lens = (-(ends - starts)) % multiple
+    if not pad_lens.any():
+        return sequence
+
+    padding_mask = sequence.padding_mask
+    ids, labels, pos, masks = [], [], [], []
+    for start, end, pad in zip(starts, ends, pad_lens):
+        ids.append(sequence.input_ids[start:end])
+        labels.append(sequence.labels[start:end])
+        pos.append(positions[start:end])
+        masks.append(
+            np.zeros(end - start, dtype=np.bool_)
+            if padding_mask is None
+            else padding_mask[start:end]
+        )
+        if pad:
+            ids.append(np.full(pad, _PAD_ID, dtype=sequence.input_ids.dtype))
+            labels.append(np.full(pad, IGNORE_INDEX, dtype=sequence.labels.dtype))
+            pos.append(positions[end - 1] + 1 + np.arange(pad, dtype=positions.dtype))
+            masks.append(np.ones(pad, dtype=np.bool_))
+    return TextSequence(
+        input_ids=np.concatenate(ids),
+        labels=np.concatenate(labels),
+        positions=np.concatenate(pos),
+        padding_mask=np.concatenate(masks),
+    )
+
+
+def _aligned_source(
+    dataset_config: DatasetConfig,
+    *,
+    multiple: int,
+    context: DatasetBuildContext,
+    dataset_iteration_policy: DatasetIterationPolicy,
+) -> GrainDataset:
+    """Build a packing source, padding every segment to a multiple of ``multiple``.
+
+    Alignment is a property of the source: it must hold before the packer concatenates
+    and splits, and it survives because every downstream cut (``max_context_length`` and
+    the row capacity) is a multiple too. ``multiple <= 1`` disables it.
+    """
+    if multiple > 1:
+        for name, size in (
+            ("max_context_length", context.max_context_length),
+            ("num_tokens_per_batch", context.num_tokens_per_batch),
+        ):
+            if size % multiple != 0:
+                raise ValueError(
+                    f"{name} ({size}) must be a multiple of "
+                    f"pad_segments_to_multiple ({multiple})."
+                )
+    dataset = dataset_config.build(
+        context=context,
+        dataset_iteration_policy=dataset_iteration_policy,
+    )
+    if multiple > 1:
+        dataset = dataset.map(partial(_pad_segments_to_multiple, multiple=multiple))
+    return dataset
 
 
 def _text_sequence_to_packing_input(

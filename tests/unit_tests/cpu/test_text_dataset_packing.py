@@ -7,9 +7,13 @@
 import os
 import unittest
 
+import numpy as np
 import torch
 
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.components.data.dataset import TextSequence
+from torchtitan.components.data.packing import _pad_segments_to_multiple
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
@@ -117,6 +121,44 @@ class TestTextDatasetBufferCheckpointing(unittest.TestCase):
             self.assertTrue(
                 torch.equal(expected_inputs["labels"], actual_inputs["labels"])
             )
+
+
+class TestSegmentAlignment(unittest.TestCase):
+    """``pad_segments_to_multiple`` keeps every document segment on a multiple."""
+
+    @staticmethod
+    def _sequence(lengths: list[int]) -> TextSequence:
+        positions = np.concatenate([np.arange(n, dtype=np.int64) for n in lengths])
+        num_tokens = len(positions)
+        return TextSequence(
+            input_ids=np.arange(num_tokens, dtype=np.int64),
+            labels=np.arange(num_tokens, dtype=np.int64),
+            positions=positions,
+            padding_mask=np.zeros(num_tokens, dtype=np.bool_),
+        )
+
+    def test_pads_each_segment_to_a_multiple(self):
+        padded = _pad_segments_to_multiple(self._sequence([3, 5]), multiple=2)
+        positions = np.asarray(padded.positions)
+        self.assertEqual(len(padded.input_ids), 10)  # 3->4, 5->6
+        # Segments still reset to 0, and each is now even.
+        starts = np.flatnonzero(np.concatenate(([True], positions[1:] == 0)))
+        ends = np.append(starts[1:], len(positions))
+        self.assertTrue(all((ends - starts) % 2 == 0))
+        self.assertEqual(list(starts), [0, 4])
+
+    def test_pads_are_masked_and_ignored(self):
+        padded = _pad_segments_to_multiple(self._sequence([3, 5]), multiple=2)
+        positions = np.asarray(padded.positions)
+        is_pad = np.asarray(padded.padding_mask)
+        # The appended token of the first segment carries the pad label and mask.
+        self.assertTrue(is_pad[3])
+        self.assertEqual(int(padded.labels[3]), IGNORE_INDEX)
+        self.assertEqual(int(positions[3]), 3)  # positions continue inside the segment
+
+    def test_already_aligned_is_untouched(self):
+        sequence = self._sequence([4, 6])
+        self.assertIs(_pad_segments_to_multiple(sequence, multiple=2), sequence)
 
 
 if __name__ == "__main__":
