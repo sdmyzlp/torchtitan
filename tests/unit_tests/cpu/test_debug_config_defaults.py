@@ -40,6 +40,10 @@ from torchtitan.models.deepseek_v4.config_registry import (
     deepseek_v4_debugmodel,
     deepseek_v4_mtp_debugmodel,
 )
+from torchtitan.models.deepseek_v4_1.config_registry import (
+    deepseek_v4_1_debugmodel,
+    deepseek_v4_1_debugmodel_candidates,
+)
 from torchtitan.models.gpt_oss.config_registry import (
     gpt_oss_debugmodel,
     gpt_oss_debugmodel_flex,
@@ -97,6 +101,8 @@ _DEBUG_CONFIG_FACTORIES: tuple[DebugConfigFactory, ...] = (
     deepseek_v3_debugmodel_mxfp8,
     deepseek_v4_debugmodel,
     deepseek_v4_mtp_debugmodel,
+    deepseek_v4_1_debugmodel,
+    deepseek_v4_1_debugmodel_candidates,
     gpt_oss_debugmodel,
     gpt_oss_debugmodel_flex,
     kimi_k2_5_debugmodel,
