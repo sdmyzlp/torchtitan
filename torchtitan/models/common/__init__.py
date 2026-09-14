@@ -24,7 +24,7 @@ from .attention import (
 from .decoder import Decoder, TransformerBlock
 from .embedding import Embedding
 from .feed_forward import compute_ffn_hidden_dim, FeedForward, SigmoidGatedFeedForward
-from .linear import Linear, PartialBiasRowwiseLinear, RouterGateLinear
+from .linear import BatchedLinear, Linear, PartialBiasRowwiseLinear, RouterGateLinear
 from .moe import MicrobatchWiseLoadBalanceLoss, MoE
 from .nn_modules import (
     Conv1d,
@@ -51,6 +51,7 @@ __all__ = [
     "SigmoidGatedFeedForward",
     "FlexInnerAttention",
     "QKVLinear",
+    "BatchedLinear",
     "GELU",
     "get_causal_mask_mod",
     "get_document_mask_mod",
