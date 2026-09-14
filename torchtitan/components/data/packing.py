@@ -13,9 +13,12 @@ from typing import Any
 import grain.python as grain
 import numpy as np
 
-from torchtitan.components.data.dataset import DatasetConfig, TextSequence
+from torchtitan.components.data.dataset import DatasetConfig, GrainDataset, TextSequence
 from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
 from torchtitan.components.loss import IGNORE_INDEX
+
+# The id both packers use for their own row padding.
+_PAD_ID = 0
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -30,7 +33,8 @@ class ConcatThenSplitPackingConfig:
         context: DatasetBuildContext,
         dataset_iteration_policy: DatasetIterationPolicy,
     ) -> grain.IterDataset:
-        dataset = self.dataset.build(
+        dataset = _aligned_source(
+            self.dataset,
             context=context,
             dataset_iteration_policy=dataset_iteration_policy,
         )
@@ -239,7 +243,8 @@ class FirstFitPackingConfig:
         context: DatasetBuildContext,
         dataset_iteration_policy: DatasetIterationPolicy,
     ) -> grain.IterDataset:
-        dataset = self.dataset.build(
+        dataset = _aligned_source(
+            self.dataset,
             context=context,
             dataset_iteration_policy=dataset_iteration_policy,
         )
@@ -351,6 +356,72 @@ def _next_document_chunk_end(
 def _packing_output_is_full(packing_output: dict[str, np.ndarray]) -> bool:
     """Return whether concat-then-split filled the entire token batch."""
     return bool(np.all(np.asarray(packing_output["input_ids_segment_ids"]) != 0))
+
+
+def _pad_segments_to_multiple(sequence: TextSequence, *, multiple: int) -> TextSequence:
+    """Append pad tokens so every position-reset segment is a multiple of ``multiple``.
+
+    Padding stays inside its segment: positions continue (``L, L+1, ...``) so the segment
+    does not split, the pads carry ``IGNORE_INDEX`` labels and a true ``padding_mask``,
+    and the ``positions == 0`` segment boundaries are unchanged. ``multiple == 1`` and an
+    empty sequence both fall out with nothing to pad.
+    """
+    num_tokens = len(sequence.input_ids)
+    positions = sequence.positions
+    if positions is None:
+        positions = np.arange(num_tokens, dtype=np.int64)
+
+    starts = np.flatnonzero(np.concatenate(([True], positions[1:] == 0)))
+    ends = np.append(starts[1:], num_tokens)
+    pad_lens = (-(ends - starts)) % multiple
+    if not pad_lens.any():
+        return sequence
+
+    padding_mask = sequence.padding_mask
+    if padding_mask is None:
+        # Missing masks read as all-false downstream, but the pads must be marked.
+        padding_mask = np.zeros(num_tokens, dtype=np.bool_)
+
+    ids, labels, pos, masks = [], [], [], []
+    for start, end, pad in zip(starts, ends, pad_lens):
+        ids.append(sequence.input_ids[start:end])
+        labels.append(sequence.labels[start:end])
+        pos.append(positions[start:end])
+        masks.append(padding_mask[start:end])
+        if pad:
+            ids.append(np.full(pad, _PAD_ID, dtype=sequence.input_ids.dtype))
+            labels.append(np.full(pad, IGNORE_INDEX, dtype=sequence.labels.dtype))
+            pos.append(positions[end - 1] + 1 + np.arange(pad, dtype=positions.dtype))
+            masks.append(np.ones(pad, dtype=np.bool_))
+    return TextSequence(
+        input_ids=np.concatenate(ids),
+        labels=np.concatenate(labels),
+        positions=np.concatenate(pos),
+        padding_mask=np.concatenate(masks),
+    )
+
+
+def _aligned_source(
+    dataset_config: DatasetConfig,
+    *,
+    context: DatasetBuildContext,
+    dataset_iteration_policy: DatasetIterationPolicy,
+) -> GrainDataset:
+    """Build a packing source with every document segment on the context's alignment.
+
+    Alignment is a property of the source rather than of one packing recipe: the packer
+    only concatenates and dices tokens, so its input has to arrive aligned, and the input
+    may itself already be packed (one ``TextSequence`` can hold many documents).
+    ``pad_segments_to_multiple <= 1`` disables it.
+    """
+    dataset = dataset_config.build(
+        context=context,
+        dataset_iteration_policy=dataset_iteration_policy,
+    )
+    multiple = context.pad_segments_to_multiple
+    if multiple > 1:
+        dataset = dataset.map(partial(_pad_segments_to_multiple, multiple=multiple))
+    return dataset
 
 
 def _text_sequence_to_packing_input(

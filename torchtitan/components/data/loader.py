@@ -78,6 +78,17 @@ class GrainDataLoader(BaseDataLoader):
         """Concurrent indexed reads used when a `MapDataset` becomes an `IterDataset`."""
         num_prefetch_batches: Annotated[int, tyro.conf.Suppress] = 2
         """Collated batches queued per rank for trainer consumption."""
+        pad_segments_to_multiple: Annotated[int, tyro.conf.Suppress] = 1
+        """Pad every packed document segment to a multiple of this; ``1`` for none.
+
+        Set by models that pool consecutive tokens (deeply compressed attention)."""
+
+        def __post_init__(self) -> None:
+            # Explicit base call: `slots=True` rebuilds the class, which breaks
+            # zero-argument `super()` in a method defined on the dataclass.
+            BaseDataLoader.Config.__post_init__(self)
+            if self.pad_segments_to_multiple < 1:
+                raise ValueError("pad_segments_to_multiple must be positive")
 
     def __init__(
         self,
@@ -106,6 +117,18 @@ class GrainDataLoader(BaseDataLoader):
         self._rank_id = f"dp_rank_{dp_rank}"
         self.max_num_documents = config.max_num_documents
 
+        # Every row cut must land on the pooling grid, otherwise the documents after
+        # it shift off it. Checked here because this is where both sizes are known.
+        for name, size in (
+            ("max_context_length", max_context_length),
+            ("num_tokens_per_batch", num_tokens_per_batch),
+        ):
+            if size % config.pad_segments_to_multiple != 0:
+                raise ValueError(
+                    f"{name} ({size}) must be a multiple of "
+                    f"pad_segments_to_multiple ({config.pad_segments_to_multiple})."
+                )
+
         # Build the dataset graph and collator.
         read_options = config.read_options
         context = DatasetBuildContext(
@@ -113,6 +136,7 @@ class GrainDataLoader(BaseDataLoader):
             max_context_length=max_context_length,
             num_tokens_per_batch=num_tokens_per_batch,
             read_options=read_options,
+            pad_segments_to_multiple=config.pad_segments_to_multiple,
             max_num_documents=config.max_num_documents,
         )
         dataset_iteration_policy = DatasetIterationPolicy(

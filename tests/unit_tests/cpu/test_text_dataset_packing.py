@@ -7,9 +7,13 @@
 import os
 import unittest
 
+import numpy as np
 import torch
 
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.components.data.dataset import TextSequence
+from torchtitan.components.data.packing import _pad_segments_to_multiple
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
@@ -18,11 +22,14 @@ _TOKENIZER_PATH = os.path.join(
 )
 
 
-def _build_dataloader(max_context_length: int) -> GrainDataLoader:
+def _build_dataloader(
+    max_context_length: int, *, pad_segments_to_multiple: int = 1
+) -> GrainDataLoader:
     return GrainDataLoader.Config(
         dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
         shuffle=False,
         num_prefetch_batches=0,
+        pad_segments_to_multiple=pad_segments_to_multiple,
     ).build(
         dp_world_size=1,
         dp_rank=0,
@@ -116,6 +123,70 @@ class TestTextDatasetBufferCheckpointing(unittest.TestCase):
             )
             self.assertTrue(
                 torch.equal(expected_inputs["labels"], actual_inputs["labels"])
+            )
+
+
+class TestSegmentAlignment(unittest.TestCase):
+    """``pad_segments_to_multiple`` keeps every document segment on a multiple."""
+
+    @staticmethod
+    def _sequence(lengths: list[int]) -> TextSequence:
+        positions = np.concatenate([np.arange(n, dtype=np.int64) for n in lengths])
+        num_tokens = len(positions)
+        return TextSequence(
+            input_ids=np.arange(num_tokens, dtype=np.int64),
+            labels=np.arange(num_tokens, dtype=np.int64),
+            positions=positions,
+            padding_mask=np.zeros(num_tokens, dtype=np.bool_),
+        )
+
+    def test_pads_each_segment_to_a_multiple(self):
+        padded = _pad_segments_to_multiple(self._sequence([3, 5]), multiple=2)
+        positions = np.asarray(padded.positions)
+        self.assertEqual(len(padded.input_ids), 10)  # 3->4, 5->6
+        # Segments still reset to 0, and each is now even.
+        starts = np.flatnonzero(np.concatenate(([True], positions[1:] == 0)))
+        ends = np.append(starts[1:], len(positions))
+        self.assertTrue(all((ends - starts) % 2 == 0))
+        self.assertEqual(list(starts), [0, 4])
+
+    def test_pads_are_masked_and_ignored(self):
+        padded = _pad_segments_to_multiple(self._sequence([3, 5]), multiple=2)
+        positions = np.asarray(padded.positions)
+        is_pad = np.asarray(padded.padding_mask)
+        # The appended token of the first segment carries the pad label and mask.
+        self.assertTrue(is_pad[3])
+        self.assertEqual(int(padded.labels[3]), IGNORE_INDEX)
+        self.assertEqual(int(positions[3]), 3)  # positions continue inside the segment
+
+    def test_already_aligned_is_untouched(self):
+        sequence = self._sequence([4, 6])
+        self.assertIs(_pad_segments_to_multiple(sequence, multiple=2), sequence)
+
+    def test_packed_rows_keep_every_segment_aligned(self):
+        """The loader config reaches the packer through the dataset build context."""
+        dataloader = _build_dataloader(256, pad_segments_to_multiple=2)
+        num_segments = 0
+        try:
+            iterator = iter(dataloader)
+            for _ in range(20):
+                positions = next(iterator)["positions"]
+                starts = (positions == 0).nonzero().flatten().tolist()
+                for start, end in zip(starts, starts[1:] + [len(positions)]):
+                    self.assertEqual((end - start) % 2, 0)
+                num_segments += len(starts)
+        finally:
+            dataloader.close()
+        # Guard against the assertion above passing vacuously.
+        self.assertGreater(num_segments, 1)
+
+    def test_rejects_unaligned_packing_sizes(self):
+        with self.assertRaisesRegex(ValueError, "max_context_length"):
+            _build_dataloader(255, pad_segments_to_multiple=2)
+        with self.assertRaisesRegex(ValueError, "pad_segments_to_multiple"):
+            GrainDataLoader.Config(
+                dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+                pad_segments_to_multiple=0,
             )
 
 

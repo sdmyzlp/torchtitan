@@ -21,6 +21,12 @@ class DatasetBuildContext:
     max_context_length: int
     num_tokens_per_batch: int
     read_options: grain.ReadOptions
+    pad_segments_to_multiple: int = 1
+    """Pad every document segment to this multiple before packing; ``1`` for none.
+
+    Consumers that pool ``k`` consecutive tokens (deeply compressed attention) need
+    segment boundaries to stay on multiples of ``k``, both for the pooling itself and
+    for the entry-to-document mapping derived from it."""
     max_num_documents: int | None = None
 
 
