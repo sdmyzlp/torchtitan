@@ -9,8 +9,12 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.common.activation import SiTUGLU
-from torchtitan.models.common.config_utils import fused_gate_up_param_init
+from torchtitan.models.common.activation import SiTUGLU, SwiGLU
+from torchtitan.models.common.config_utils import (
+    fused_gate_up_param_init,
+    make_ffn_config,
+    make_routed_experts_config,
+)
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 
@@ -113,3 +117,39 @@ def test_feed_forward_uses_configured_activation():
     gate_TF, up_TF = gate_up_TF.unflatten(-1, (-1, 2)).unbind(-1)
     expected_TD = feed_forward.w2(activation_fn.build()(gate_TF, up_TF))
     torch.testing.assert_close(feed_forward(x_TD), expected_TD)
+
+
+def test_swiglu_clamp_bounds_the_branches():
+    gate_T = torch.tensor([-20.0, 0.5, 20.0])
+    up_T = torch.tensor([-20.0, 0.5, 20.0])
+
+    torch.testing.assert_close(
+        SwiGLU(SwiGLU.Config())(gate_T, up_T), F.silu(gate_T) * up_T
+    )
+
+    clamped_T = SwiGLU(SwiGLU.Config(swiglu_limit=10.0))(gate_T, up_T)
+    expected_T = F.silu(gate_T.clamp(max=10.0)) * up_T.clamp(-10.0, 10.0)
+    torch.testing.assert_close(clamped_T, expected_T)
+    # The gate is clamped from above only: a very negative gate stays near zero
+    # instead of being pulled down to -limit.
+    assert clamped_T[0].abs() < 1e-5
+
+
+def test_swiglu_limit_reaches_both_expert_activations():
+    assert make_ffn_config(
+        dim=4,
+        hidden_dim=8,
+        w1_param_init={"weight": _fill(1.0)},
+        w2w3_param_init={"weight": _fill(1.0)},
+        swiglu_limit=10.0,
+    ).activation_fn == SwiGLU.Config(swiglu_limit=10.0)
+
+    assert make_routed_experts_config(
+        dim=4,
+        hidden_dim=8,
+        num_experts=2,
+        top_k=1,
+        param_init={"weight": _fill(1.0)},
+        comm_backend="standard",
+        swiglu_limit=10.0,
+    ).inner_experts.activation_fn == SwiGLU.Config(swiglu_limit=10.0)

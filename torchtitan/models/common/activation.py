@@ -37,10 +37,13 @@ class SwiGLU(ActivationFn):
 
     @dataclass(kw_only=True, slots=True)
     class Config(ActivationFn.Config):
-        pass
+        # Clamp on the branches before the activation, 0.0 for none: the gate
+        # branch is clamped from above only and the up branch on both sides.
+        # DeepSeek V4.1 trains with 10.0 to keep fp8/fp4 activations in range.
+        swiglu_limit: float = 0.0
 
     def __init__(self, config: Config) -> None:
-        pass
+        self.swiglu_limit = config.swiglu_limit
 
     def __call__(
         self,
@@ -49,6 +52,9 @@ class SwiGLU(ActivationFn):
         **kwargs: Any,
     ) -> torch.Tensor:
         del kwargs
+        if self.swiglu_limit > 0.0:
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         return F.silu(gate) * up
 
 

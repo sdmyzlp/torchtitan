@@ -18,6 +18,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
+from torchtitan.models.common.activation import SwiGLU
 from torchtitan.models.common.attention import (
     FlexInnerAttention,
     GQAttention,
@@ -284,12 +285,16 @@ def make_ffn_config(
     w1_param_init: dict[str, Callable],
     w2w3_param_init: dict[str, Callable],
     tp_gemm_backend: TpGemmBackend = "default",
+    swiglu_limit: float = 0.0,
 ) -> FeedForward.Config:
     """Build a fully-specified FeedForward.Config.
 
     ``tp_gemm_backend="dist_gemm"`` overlaps the TP collectives with the GEMMs by
     folding them in: one all-gather feeds w13, and w2 reduce-scatters. See
     make_gqa_config.
+
+    ``swiglu_limit`` clamps the gate/up branches of the SwiGLU activation, as
+    DeepSeek-V4.x does for its shared and routed experts.
     """
     ffn_cls = DistGEMMFeedForward if tp_gemm_backend == "dist_gemm" else FeedForward
     return ffn_cls.Config(
@@ -301,6 +306,7 @@ def make_ffn_config(
         w2=Linear.Config(
             in_features=hidden_dim, out_features=dim, param_init=w2w3_param_init
         ),
+        activation_fn=SwiGLU.Config(swiglu_limit=swiglu_limit),
     )
 
 
@@ -427,6 +433,7 @@ def make_routed_experts_config(
     non_blocking_capacity_factor: float | None = None,
     num_max_tokens_per_rank: int | None = None,
     cudagraphable: bool = False,
+    swiglu_limit: float = 0.0,
 ) -> RoutedExperts.Config:
     """Build a fully-specified RoutedExperts.Config (inner_experts + token_dispatcher)."""
     return RoutedExperts.Config(
@@ -435,6 +442,7 @@ def make_routed_experts_config(
             hidden_dim=hidden_dim,
             num_experts=num_experts,
             param_init=param_init,
+            activation_fn=SwiGLU.Config(swiglu_limit=swiglu_limit),
         ),
         token_dispatcher=make_token_dispatcher_config(
             num_experts=num_experts,
