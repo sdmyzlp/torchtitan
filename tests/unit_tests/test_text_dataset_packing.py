@@ -9,13 +9,16 @@ import unittest
 
 import torch
 
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataset
+from torchtitan.hf_datasets.text_datasets import _PAD_ID, HuggingFaceTextDataset
 
 _TOKENIZER_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "tokenizer")
 
 
-def _build_dataset(seq_len: int) -> HuggingFaceTextDataset:
+def _build_dataset(
+    seq_len: int, *, pad_segments_to_multiple: int = 1
+) -> HuggingFaceTextDataset:
     return HuggingFaceTextDataset(
         dataset_name="c4_test",
         dataset_path=None,
@@ -24,6 +27,7 @@ def _build_dataset(seq_len: int) -> HuggingFaceTextDataset:
         dp_rank=0,
         dp_world_size=1,
         infinite=True,
+        pad_segments_to_multiple=pad_segments_to_multiple,
     )
 
 
@@ -72,6 +76,68 @@ class TestTextDatasetPacking(unittest.TestCase):
 
         # Guard against the assertions above passing vacuously.
         self.assertGreater(interior_doc_starts, 0)
+
+
+class TestSegmentAlignment(unittest.TestCase):
+    """Pad every document segment to a multiple for token-pooling models.
+
+    A model that pools k consecutive tokens into one compressed entry pools two
+    documents together whenever a document boundary is not a multiple of k, so
+    the token stream pads each document to a multiple of k first.
+    """
+
+    _MULTIPLE = 4
+
+    def test_every_document_segment_is_aligned(self):
+        it = iter(_build_dataset(256, pad_segments_to_multiple=self._MULTIPLE))
+        num_segments = 0
+        for _ in range(50):
+            positions = next(it)[0]["positions"]
+            starts = (positions == 0).nonzero().flatten().tolist()
+            for start, end in zip(starts, starts[1:] + [len(positions)]):
+                self.assertEqual((end - start) % self._MULTIPLE, 0)
+            num_segments += len(starts)
+
+        # Guard against the assertions above passing vacuously.
+        self.assertGreater(num_segments, 1)
+
+    def test_pads_are_ignored_and_end_their_segment(self):
+        it = iter(_build_dataset(256, pad_segments_to_multiple=self._MULTIPLE))
+        num_pads = 0
+        for _ in range(50):
+            input_dict, labels = next(it)
+            input_ids = input_dict["input"]
+            positions = input_dict["positions"]
+
+            # Inputs and labels are shifted per document, so every real token
+            # predicts something: only an alignment pad carries IGNORE_INDEX.
+            is_pad = labels == IGNORE_INDEX
+            self.assertTrue(bool(torch.all(input_ids[is_pad] == _PAD_ID)))
+
+            # A pad fills the tail of its own segment, and positions keep
+            # running through it instead of restarting.
+            starts = (positions == 0).nonzero().flatten().tolist()
+            for start, end in zip(starts, starts[1:] + [len(positions)]):
+                segment_pads = is_pad[start:end]
+                first_pad = segment_pads.nonzero().flatten()
+                if len(first_pad) == 0:
+                    continue
+                self.assertTrue(bool(torch.all(segment_pads[first_pad[0] :])))
+                self.assertGreater(int(first_pad[0]), 0)
+                pad_start = start + int(first_pad[0])
+                self.assertEqual(
+                    int(positions[pad_start]), int(positions[pad_start - 1]) + 1
+                )
+                num_pads += int(segment_pads.sum())
+
+        # Guard against the assertions above passing vacuously.
+        self.assertGreater(num_pads, 0)
+
+    def test_rejects_unaligned_seq_len(self):
+        with self.assertRaisesRegex(ValueError, "seq_len"):
+            _build_dataset(255, pad_segments_to_multiple=2)
+        with self.assertRaisesRegex(ValueError, "pad_segments_to_multiple"):
+            _build_dataset(256, pad_segments_to_multiple=0)
 
 
 class TestTextDatasetBufferCheckpointing(unittest.TestCase):

@@ -46,6 +46,13 @@ class BaseDataLoader(Stateful, ABC, Configurable):
     class Config(Configurable.Config):
         dataset: str = ""
         dataset_path: str | None = None
+        pad_segments_to_multiple: int = 1
+        """Pad every document segment of a packed sequence to a multiple of this.
+
+        Models that pool k consecutive tokens (deeply compressed attention) need each
+        document segment to hold a multiple of k, because the pooling and the
+        entry->document mapping are only segment-exact then. 1 leaves packing as is.
+        """
 
     @abstractmethod
     def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:

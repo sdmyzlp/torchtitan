@@ -70,6 +70,44 @@ def _validate_dataset(
     return path, config.loader, config.sample_processor
 
 
+# The id appended by alignment padding. It is never fed to the model as a target,
+# so any id works as long as it is in vocabulary.
+_PAD_ID = 0
+
+
+def _pad_segment_to_multiple(
+    input_ids: list[int], labels: list[int], *, multiple: int
+) -> tuple[list[int], list[int]]:
+    """Pad one document segment so its token count is a multiple of ``multiple``.
+
+    The caller keeps positions running through the pads, so a pad stays inside its own
+    document segment: it splits no document and the next document still starts at
+    position 0, while the ``IGNORE_INDEX`` labels keep the pads out of the loss.
+    """
+    pad_len = -len(input_ids) % multiple
+    if pad_len == 0:
+        return input_ids, labels
+    return (
+        input_ids + [_PAD_ID] * pad_len,
+        labels + [IGNORE_INDEX] * pad_len,
+    )
+
+
+def _validate_packing_alignment(seq_len: int, pad_segments_to_multiple: int) -> None:
+    """Check the alignment a packed sequence must keep end to end.
+
+    Rows are cut every ``seq_len`` tokens, so a row boundary that is not a multiple of
+    the alignment shifts every later document off the pooling grid.
+    """
+    if pad_segments_to_multiple < 1:
+        raise ValueError("pad_segments_to_multiple must be positive")
+    if seq_len % pad_segments_to_multiple != 0:
+        raise ValueError(
+            f"seq_len ({seq_len}) must be a multiple of "
+            f"pad_segments_to_multiple ({pad_segments_to_multiple})."
+        )
+
+
 class HuggingFaceTextDataset(IterableDataset, Stateful):
     def __init__(
         self,
@@ -80,10 +118,12 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
+        pad_segments_to_multiple: int = 1,
     ) -> None:
         # Force lowercase for consistent comparison
         dataset_name = dataset_name.lower()
 
+        _validate_packing_alignment(seq_len, pad_segments_to_multiple)
         path, dataset_loader, text_processor = _validate_dataset(
             dataset_name, dataset_path
         )
@@ -97,6 +137,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         self._tokenizer = tokenizer
         self.seq_len = seq_len
         self.infinite = infinite
+        self.pad_segments_to_multiple = pad_segments_to_multiple
         self._text_processor = text_processor
 
         # Variables for checkpointing
@@ -139,15 +180,22 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                 # a document's last token is never the next document's first
                 # token. The buffers are therefore already next-token aligned
                 # and a full sample is exactly seq_len tokens.
-                self._inputs_buffer.extend(sample_tokens[:-1])
-                self._labels_buffer.extend(sample_tokens[1:])
+                padded_inputs, padded_labels = _pad_segment_to_multiple(
+                    sample_tokens[:-1],
+                    sample_tokens[1:],
+                    multiple=self.pad_segments_to_multiple,
+                )
+                self._inputs_buffer.extend(padded_inputs)
+                self._labels_buffer.extend(padded_labels)
                 # Per-document positions reset at document boundaries,
                 # matching inference frameworks (e.g. vLLM) that start
                 # positions at 0 per request.  Positions wrap at seq_len
                 # to stay within the RoPE cache, effectively chunking
                 # long documents into seq_len-sized segments.
                 # TODO: make overflow policy configurable (chunk / truncate / drop).
-                self._positions_buffer.extend(range(len(sample_tokens) - 1))
+                # The pads continue the document's positions, so they stay inside
+                # its segment instead of starting one of their own.
+                self._positions_buffer.extend(range(len(padded_inputs)))
                 self._sample_idx += 1
 
                 while len(self._inputs_buffer) >= self.seq_len:
@@ -270,6 +318,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             infinite=config.infinite,
+            pad_segments_to_multiple=config.pad_segments_to_multiple,
         )
 
         dataloader_kwargs = {
@@ -347,6 +396,7 @@ class InterleavedHuggingFaceTextDataLoader(ParallelAwareDataloader):
                     dp_rank=dp_rank,
                     dp_world_size=dp_world_size,
                     infinite=source.infinite,
+                    pad_segments_to_multiple=config.pad_segments_to_multiple,
                 )
                 for source in config.sources
             ],
@@ -389,12 +439,15 @@ class ChatDataset(IterableDataset, Stateful):
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
+        pad_segments_to_multiple: int = 1,
     ) -> None:
         if tokenizer.eos_id is None:
             raise ValueError(
                 "Tokenizer does not have an eos_id set. "
                 "ChatDataset requires a tokenizer with a valid EOS token."
             )
+
+        _validate_packing_alignment(seq_len, pad_segments_to_multiple)
 
         # Shuffle the initial data to promote an even distribution across nodes. For map-style
         # datasets, split_dataset_by_node assigns contiguous data chunks to consecutive nodes, which
@@ -407,6 +460,7 @@ class ChatDataset(IterableDataset, Stateful):
         self._eos_id = tokenizer.eos_id
         self.seq_len = seq_len
         self.infinite = infinite
+        self.pad_segments_to_multiple = pad_segments_to_multiple
         self._sample_processor = sample_processor
 
         self._dataset_id = f"{dataset.info.dataset_name}/{dataset.split}"
@@ -453,9 +507,10 @@ class ChatDataset(IterableDataset, Stateful):
         """Tokenize a single-turn sample and create input/label pairs.
 
         Returns (input_ids, label_ids) where input_ids = tokens[:-1] and
-        label_ids = tokens[1:] with prompt tokens masked as IGNORE_INDEX.
-        Returns None if the sample exceeds seq_len (dropped to avoid
-        training on truncated responses).
+        label_ids = tokens[1:] with prompt tokens masked as IGNORE_INDEX, both
+        padded to ``pad_segments_to_multiple``. Returns None if the padded
+        sample exceeds seq_len (dropped to avoid training on truncated
+        responses).
 
         Uses incremental prefix re-tokenization to find the prompt/response
         token boundary, avoiding BPE merge errors.
@@ -474,8 +529,11 @@ class ChatDataset(IterableDataset, Stateful):
             logger.info(f"[ChatDataset] First sample full:\n{full_text}")
             self._logged_first_sample = True
 
-        # Drop examples exceeding seq_len rather than truncating.
-        if len(full_tokens) - 1 > self.seq_len:
+        # Drop examples exceeding seq_len rather than truncating. Alignment
+        # padding counts toward the row the example has to fit in.
+        num_tokens = len(full_tokens) - 1
+        pad_len = -num_tokens % self.pad_segments_to_multiple
+        if num_tokens + pad_len > self.seq_len:
             logger.debug(
                 f"Dropping sample {self._sample_idx}: "
                 f"tokens exceeds seq_len {self.seq_len}"
@@ -484,6 +542,11 @@ class ChatDataset(IterableDataset, Stateful):
 
         input_ids = full_tokens[:-1]
         label_ids = full_tokens[1:]
+        # The pads continue the example's positions and are ignored by the loss,
+        # so the next example still starts a new segment on an aligned boundary.
+        if pad_len > 0:
+            input_ids += [_PAD_ID] * pad_len
+            label_ids += [IGNORE_INDEX] * pad_len
 
         # Find prompt/response boundary by tokenizing just the user message
         # with add_generation_prompt=True.
@@ -684,6 +747,7 @@ class ChatDataLoader(ParallelAwareDataloader):
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             infinite=config.infinite,
+            pad_segments_to_multiple=config.pad_segments_to_multiple,
         )
 
         dataloader_kwargs = {
@@ -763,6 +827,7 @@ class InterleavedChatDataLoader(ParallelAwareDataloader):
                     dp_rank=dp_rank,
                     dp_world_size=dp_world_size,
                     infinite=source.infinite,
+                    pad_segments_to_multiple=config.pad_segments_to_multiple,
                 )
                 for source in config.sources
             ],

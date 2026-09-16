@@ -212,6 +212,48 @@ class TestChatDatasetPerDocumentPositions(unittest.TestCase):
             )
 
 
+class TestChatDatasetSegmentAlignment(unittest.TestCase):
+    """Packed chat examples are padded to pad_segments_to_multiple.
+
+    A model that pools k consecutive tokens into one compressed entry pools two
+    examples together whenever an example boundary is not a multiple of k.
+    """
+
+    _MULTIPLE = 4
+
+    def test_every_example_segment_is_aligned(self):
+        chat_ds = ChatDataset(
+            dataset=_load_dataset(),
+            tokenizer=_load_tokenizer(),
+            sample_processor=_process_sample,
+            seq_len=256,
+            infinite=False,
+            pad_segments_to_multiple=self._MULTIPLE,
+        )
+
+        num_segments = 0
+        for batch, _ in chat_ds:
+            positions = batch["positions"]
+            starts = (positions == 0).nonzero(as_tuple=True)[0].tolist()
+            for start, end in zip(starts, starts[1:] + [len(positions)]):
+                self.assertEqual((end - start) % self._MULTIPLE, 0)
+            num_segments += len(starts)
+
+        # Guard against the assertions above passing vacuously.
+        self.assertGreater(num_segments, 1)
+
+    def test_rejects_unaligned_seq_len(self):
+        with self.assertRaisesRegex(ValueError, "seq_len"):
+            ChatDataset(
+                dataset=_load_dataset(),
+                tokenizer=_load_tokenizer(),
+                sample_processor=_process_sample,
+                seq_len=255,
+                infinite=False,
+                pad_segments_to_multiple=2,
+            )
+
+
 class TestChatDatasetDropOnOverflow(unittest.TestCase):
     """Samples exceeding seq_len are silently dropped."""
 

@@ -201,6 +201,37 @@ class TestParallelAwareDataloader(unittest.TestCase):
                         # BOS token should have position 0
                         self.assertEqual(pos.item(), 0)
 
+    def test_pads_document_segments_to_a_multiple(self):
+        """The config reaches the dataset, which pads each document to it."""
+        multiple = 4
+        dl_config = HuggingFaceTextDataLoader.Config(
+            dataset="c4_test",
+            num_workers=0,
+            infinite=False,
+            pad_segments_to_multiple=multiple,
+        )
+
+        dataloader = HuggingFaceTextDataLoader(
+            dl_config,
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=DummyTokenizer(),
+            seq_len=(seq_len := 512),
+            local_batch_size=8,
+        )
+
+        num_segments = 0
+        for batch, _ in zip(map(lambda x: x[0], dataloader), range(10)):
+            positions = batch["positions"]
+            for row in positions:
+                starts = (row == 0).nonzero().flatten().tolist()
+                for start, end in zip(starts, starts[1:] + [len(row)]):
+                    self.assertEqual((end - start) % multiple, 0)
+                num_segments += len(starts)
+
+        # Guard against the assertions above passing vacuously.
+        self.assertGreater(num_segments, 1)
+
 
 class TestInterleavedHuggingFaceTextDataLoader(unittest.TestCase):
     def _make_config(self, **kwargs) -> InterleavedHuggingFaceTextDataLoader.Config:
