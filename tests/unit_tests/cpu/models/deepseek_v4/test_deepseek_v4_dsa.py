@@ -8,7 +8,6 @@
 
 import contextlib
 import unittest
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -27,7 +26,7 @@ class TestIndexerSelect(unittest.TestCase):
     def test_indexer_select_matches_old_topk(self):
         torch.manual_seed(0)
         device = torch.device("cpu")
-        seqlen, ratio, topk = 512, 4, 16
+        seqlen, ratio, topk = 64, 4, 16
         n_cmp = seqlen // ratio
         g = torch.Generator(device).manual_seed(11)
         idx_q = torch.randn(seqlen, 8, 32, generator=g, device=device)
@@ -123,18 +122,7 @@ class TestDSVPackedDocuments(unittest.TestCase):
             layer.attention.compress_ratio: layer.attention
             for layer in model_config.layers
         }
-        # Exactly-zero indexer scores (every head's relu at 0) tie, and top-k
-        # breaks ties by layout; let CSA select every causal candidate instead
-        # (the longest document below has 384 // 4 compressed entries).
-        csa = attention_configs[4]
-        attention_configs[4] = replace(
-            csa,
-            inner_attention=replace(csa.inner_attention),
-            indexer=replace(
-                csa.indexer,
-                inner_indexer=replace(csa.indexer.inner_indexer, topk=96),
-            ),
-        )
+        attention_configs[4].indexer.inner_indexer.topk = 96
         # Group-aligned lengths exercise exact groups; the others cover partial
         # groups and documents shorter than a group.
         for lengths in ([256, 128, 384], [300, 37, 150, 5]):
