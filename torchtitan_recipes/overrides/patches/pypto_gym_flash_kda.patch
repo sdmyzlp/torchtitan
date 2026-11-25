@@ -1,0 +1,308 @@
+--- a/ops/pypto_pro/kimi_k3/flash_kda/op_kernel/flash_kda_bwd.py
++++ b/ops/pypto_pro/kimi_k3/flash_kda/op_kernel/flash_kda_bwd.py
+@@ -85,7 +85,7 @@
+         for _ in pl.range(0, 1, 1):
+             p_1 = vf.update_mask(32, dtype=pl.DT_FP32)
+             mul_1 = r * 128
+-            x = vf.load_align(src, mul_1, dist=pl.LoadDist.US_B16)
++            x = vf.load_align(src, mul_1, dist=pl.LoadDist.UNPK_B16)
+             y = vf.astype(x, p16_1, dtype=pl.DT_FP32, round_mode=pl.VFRoundMode.CAST_RINT, saturate=pl.SaturateMode.OFF)
+             vf.store_align(dst, y, p_1, mul_1)
+
+@@ -190,7 +190,7 @@
+     for r in pl.range(0, 32):
+         for j in pl.range(0, 2):
+             off = r * 128 + j * 64
+-            xb = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            xb = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             x = vf.astype(xb, p16, dtype=pl.DT_FP32)
+             gv = vf.load_align(g, off)
+             e = vf.exp(gv, p)
+@@ -211,7 +211,7 @@
+     for r in pl.range(0, 32):
+         for j in pl.range(0, 2):
+             off = r * 128 + j * 64
+-            xb = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            xb = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             x = vf.astype(xb, p16, dtype=pl.DT_FP32)
+             gv = vf.load_align(g, off)
+             gl = vf.load_align(last, j * 64)
+@@ -295,7 +295,7 @@
+             mul = j * 64
+             p_1 = vf.update_mask(64, dtype=pl.DT_FP32)
+             add = r * 128 + mul
+-            x = vf.load_align(src, add, dist=pl.LoadDist.US_B16)
++            x = vf.load_align(src, add, dist=pl.LoadDist.UNPK_B16)
+             y = vf.astype(x, p16_1, dtype=pl.DT_FP32, round_mode=pl.VFRoundMode.CAST_RINT, saturate=pl.SaturateMode.OFF)
+             vf.store_align(dst, y, p_1, add)
+
+@@ -346,7 +346,7 @@
+             mul = j * 64
+             p_1 = vf.update_mask(64, dtype=pl.DT_FP32)
+             add = r * 128 + mul
+-            x = vf.load_align(src, add, dist=pl.LoadDist.US_B16)
++            x = vf.load_align(src, add, dist=pl.LoadDist.UNPK_B16)
+             y = vf.astype(x, p16_1, dtype=pl.DT_FP32, round_mode=pl.VFRoundMode.CAST_RINT, saturate=pl.SaturateMode.OFF)
+             vf.store_align(dst, y, p_1, add)
+
+@@ -388,7 +388,7 @@
+     p = vf.update_mask(64, dtype=pl.DT_FP32)
+     pb = vf.create_mask(pattern=pl.MaskPattern.ALL, dtype=pl.DT_BF16)
+     for r in pl.range(0, 128):
+-        x = vf.load_align(src, r * 128, dist=pl.LoadDist.US_B16)
++        x = vf.load_align(src, r * 128, dist=pl.LoadDist.UNPK_B16)
+         y = vf.astype(x, pb, dtype=pl.DT_FP32)
+         vf.store_align(dst, y, p, r * 128)
+
+@@ -404,8 +404,8 @@
+         add = mul + 64
+         a1 = vf.load_align(states, 8192 + add)
+         pb = vf.create_mask(pattern=pl.MaskPattern.ALL, dtype=pl.DT_BF16)
+-        b0h = vf.load_align(dh_bf16, mul, dist=pl.LoadDist.US_B16)
+-        b1h = vf.load_align(dh_bf16, add, dist=pl.LoadDist.US_B16)
++        b0h = vf.load_align(dh_bf16, mul, dist=pl.LoadDist.UNPK_B16)
++        b1h = vf.load_align(dh_bf16, add, dist=pl.LoadDist.UNPK_B16)
+         b0 = vf.astype(b0h, pb, dtype=pl.DT_FP32)
+         b1 = vf.astype(b1h, pb, dtype=pl.DT_FP32)
+         p0 = vf.mul(a0, b0, p_1)
+@@ -780,7 +780,7 @@
+         diag = vf.load_align(da, r * 128 + start + r, dist=pl.LoadDist.BRC_B32)
+         for j in pl.range(0, 2):
+             off = r * 128 + j * 64
+-            x16 = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            x16 = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             x = vf.astype(x16, p16, dtype=pl.DT_FP32)
+             delta = vf.mul(x, diag, p)
+             previous = vf.load_align(out, off)
+@@ -861,7 +861,7 @@
+     for r in pl.range(0, local_rows):
+         for j in pl.range(0, 2):
+             off = r * 128 + j * 64
+-            x16 = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            x16 = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             x = vf.astype(x16, p16, dtype=pl.DT_FP32)
+             e = vf.load_align(exponent, off)
+             y = vf.mul(x, e, p)
+@@ -901,7 +901,7 @@
+             off = r * 128 + j * 64
+             a = vf.load_align(dg, off)
+             b = vf.load_align(correction, off)
+-            c16 = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            c16 = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             c = vf.astype(c16, p16, dtype=pl.DT_FP32)
+             product = vf.mul(b, c, p)
+             product = vf.muls(product, sign, p)
+@@ -919,7 +919,7 @@
+         for j in pl.range(0, 2):
+             off = r * 128 + j * 64
+             a = vf.load_align(correction, off)
+-            b16 = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            b16 = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             b = vf.astype(b16, p16, dtype=pl.DT_FP32)
+             product = vf.mul(a, b, p)
+             acc = vf.add(acc, product, p)
+@@ -1032,7 +1032,7 @@
+         asum = vf.full(0.0, p, dtype=pl.DT_FP32)
+         for gate_inner in pl.range(0, pl.min(8, rows - gate_base)):
+             r = gate_base + gate_inner
+-            gb = vf.load_align(raw, r * 128, dist=pl.LoadDist.US_B16)
++            gb = vf.load_align(raw, r * 128, dist=pl.LoadDist.UNPK_B16)
+             g = vf.astype(gb, pb, dtype=pl.DT_FP32)
+             x = vf.add(g, biasv, p)
+             z = vf.mul(av, x, p)
+@@ -1219,7 +1219,7 @@
+         for _ in pl.range(0, 1, 1):
+             p_1 = vf.update_mask(64, dtype=pl.DT_FP32)
+             mul_1 = r * 128
+-            x = vf.load_align(src, mul_1, dist=pl.LoadDist.US_B16)
++            x = vf.load_align(src, mul_1, dist=pl.LoadDist.UNPK_B16)
+             y = vf.astype(x, p16_1, dtype=pl.DT_FP32, round_mode=pl.VFRoundMode.CAST_RINT, saturate=pl.SaturateMode.OFF)
+             vf.store_align(dst, y, p_1, mul_1)
+
+@@ -1420,7 +1420,7 @@
+     for r in pl.range(0, 32):
+         for j in pl.range(0, 2):
+             off = r * 128 + j * 64
+-            xb = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            xb = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             x = vf.astype(xb, p16, dtype=pl.DT_FP32)
+             gv = vf.load_align(g, off)
+             e = vf.exp(gv, p)
+@@ -1996,7 +1996,7 @@
+             previous = vf.load_align(grad, off)
+             updated = vf.add(previous, correction, p)
+             vf.store_align(grad, updated, p, off)
+-            xb = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            xb = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             raw32 = vf.astype(xb, pb, dtype=pl.DT_FP32)
+             product = vf.mul(correction, raw32, p)
+             product = vf.muls(product, sign, p)
+@@ -2019,7 +2019,7 @@
+             x = vf.load_align(result, off)
+             e = vf.load_align(exponent, off)
+             correction = vf.mul(x, e, p)
+-            xb = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            xb = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             raw32 = vf.astype(xb, pb, dtype=pl.DT_FP32)
+             product = vf.mul(correction, raw32, p)
+             acc = vf.add(acc, product, p)
+@@ -2058,9 +2058,9 @@
+             gx = vf.load_align(g, off)
+             ex = vf.exp(gx, p)
+             vf.store_align(e, ex, p, off)
+-            kx = vf.load_align(k, off, dist=pl.LoadDist.US_B16)
++            kx = vf.load_align(k, off, dist=pl.LoadDist.UNPK_B16)
+             kx_cast1 = vf.astype(kx, pb, dtype=pl.DT_FP32)
+-            vx = vf.load_align(v, off, dist=pl.LoadDist.US_B16)
++            vx = vf.load_align(v, off, dist=pl.LoadDist.UNPK_B16)
+             vx_cast2 = vf.astype(vx, pb, dtype=pl.DT_FP32)
+             ux = vf.load_align(du, off)
+             hi_cast3 = vf.astype(ux, p, dtype=pl.DT_BF16, round_mode=pl.VFRoundMode.CAST_RINT)
+@@ -2098,11 +2098,11 @@
+             gx = vf.load_align(g, off)
+             ex = vf.exp(gx, p)
+             vf.store_align(e, ex, p, off)
+-            kx = vf.load_align(k, off, dist=pl.LoadDist.US_B16)
++            kx = vf.load_align(k, off, dist=pl.LoadDist.UNPK_B16)
+             kx_cast1 = vf.astype(kx, pb, dtype=pl.DT_FP32)
+-            vx = vf.load_align(v, off, dist=pl.LoadDist.US_B16)
++            vx = vf.load_align(v, off, dist=pl.LoadDist.UNPK_B16)
+             vx_cast2 = vf.astype(vx, pb, dtype=pl.DT_FP32)
+-            ux = vf.load_align(du, off, dist=pl.LoadDist.US_B16)
++            ux = vf.load_align(du, off, dist=pl.LoadDist.UNPK_B16)
+             kh = vf.mul(kx_cast1, ex, p)
+             kh = vf.mul(kh, b, p)
+             vh = vf.mul(vx_cast2, b, p)
+@@ -2130,7 +2130,7 @@
+             ix = vf.adds(ix, k, p)
+             hx = vf.gather(h, ix, pb)
+             hx_cast1 = vf.astype(hx, pb, dtype=pl.DT_FP32)
+-            dx = vf.load_align(dh, k * 128 + j * 64, dist=pl.LoadDist.US_B16)
++            dx = vf.load_align(dh, k * 128 + j * 64, dist=pl.LoadDist.UNPK_B16)
+             dx_cast2 = vf.astype(dx, pb, dtype=pl.DT_FP32)
+             prod = vf.mul(hx_cast1, dx_cast2, p)
+             acc = vf.add(acc, prod, p)
+@@ -2156,7 +2156,7 @@
+             eg = vf.exp(eg, p)
+             x = vf.mul(x, eg, p)
+             vf.store_align(dk, x, p, off)
+-            kr = vf.load_align(k, off, dist=pl.LoadDist.US_B16)
++            kr = vf.load_align(k, off, dist=pl.LoadDist.UNPK_B16)
+             kr_cast1 = vf.astype(kr, pb, dtype=pl.DT_FP32)
+             prod = vf.mul(x, kr_cast1, p)
+             acc = vf.add(acc, prod, p)
+@@ -2184,7 +2184,7 @@
+             x = vf.muls(x, scale, p)
+             x = vf.mul(x, ex, p)
+             vf.store_align(dq, x, p, off)
+-            qr = vf.load_align(q, off, dist=pl.LoadDist.US_B16)
++            qr = vf.load_align(q, off, dist=pl.LoadDist.UNPK_B16)
+             qr_cast1 = vf.astype(qr, pb, dtype=pl.DT_FP32)
+             prod = vf.mul(x, qr_cast1, p)
+             old = vf.load_align(dg, off)
+@@ -2226,7 +2226,7 @@
+         for j in pl.range(0, 2):
+             off = r * 128 + j * 64
+             x = vf.load_align(high, off)
+-            vr = vf.load_align(v, off, dist=pl.LoadDist.US_B16)
++            vr = vf.load_align(v, off, dist=pl.LoadDist.UNPK_B16)
+             vr_cast1 = vf.astype(vr, pb, dtype=pl.DT_FP32)
+             prod = vf.mul(x, vr_cast1, p)
+             acc = vf.add(acc, prod, p)
+@@ -2296,7 +2296,7 @@
+             off = r * 128 + j * 64
+             x = vf.load_align(result, off)
+             ex = vf.load_align(e, off)
+-            kr = vf.load_align(k, off, dist=pl.LoadDist.US_B16)
++            kr = vf.load_align(k, off, dist=pl.LoadDist.UNPK_B16)
+             kr_cast1 = vf.astype(kr, pb, dtype=pl.DT_FP32)
+             dbterm = vf.mul(x, kr_cast1, p)
+             dbterm = vf.mul(dbterm, ex, p)
+@@ -2363,9 +2363,9 @@
+         a = vf.load_align(da, (first + r) * 64 + first + r, dist=pl.LoadDist.BRC_B32)
+         for j in pl.range(0, 2):
+             off = r * 128 + j * 64
+-            qr = vf.load_align(q, off, dist=pl.LoadDist.US_B16)
++            qr = vf.load_align(q, off, dist=pl.LoadDist.UNPK_B16)
+             qr_cast1 = vf.astype(qr, pb, dtype=pl.DT_FP32)
+-            kr = vf.load_align(k, (first + r) * 128 + j * 64, dist=pl.LoadDist.US_B16)
++            kr = vf.load_align(k, (first + r) * 128 + j * 64, dist=pl.LoadDist.UNPK_B16)
+             kr_cast2 = vf.astype(kr, pb, dtype=pl.DT_FP32)
+             qd = vf.load_align(dq, off)
+             kd = vf.load_align(dk, off)
+@@ -2424,7 +2424,7 @@
+             x = vf.load_align(result, off)
+             e = vf.load_align(exponent, off)
+             correction = vf.mul(x, e, p)
+-            xb = vf.load_align(raw, off, dist=pl.LoadDist.US_B16)
++            xb = vf.load_align(raw, off, dist=pl.LoadDist.UNPK_B16)
+             raw32 = vf.astype(xb, pb, dtype=pl.DT_FP32)
+             product = vf.mul(correction, raw32, p)
+             acc = vf.add(acc, product, p)
+@@ -2530,7 +2530,7 @@
+     nzindex = vf.add(nzbase, within, pb)
+     for r in pl.range(0, 16):
+         for j in pl.range(0, 2):
+-            raw16 = vf.load_align(raw, r * 128 + j * 64, dist=pl.LoadDist.US_B16)
++            raw16 = vf.load_align(raw, r * 128 + j * 64, dist=pl.LoadDist.UNPK_B16)
+             raw32 = vf.astype(raw16, pb, dtype=pl.DT_FP32)
+             e = vf.load_align(exponent, r * 128 + j * 64)
+             x = vf.mul(raw32, e, p)
+@@ -2561,7 +2561,7 @@
+     for r in pl.range(0, 16):
+         beta32 = vf.load_align(beta, first + r, dist=pl.LoadDist.BRC_B32)
+         for j in pl.range(0, 2):
+-            raw16 = vf.load_align(raw, r * 128 + j * 64, dist=pl.LoadDist.US_B16)
++            raw16 = vf.load_align(raw, r * 128 + j * 64, dist=pl.LoadDist.UNPK_B16)
+             raw32 = vf.astype(raw16, pb, dtype=pl.DT_FP32)
+             e = vf.load_align(exponent, r * 128 + j * 64)
+             x = vf.mul(raw32, e, p)
+@@ -2583,8 +2583,8 @@
+     p = vf.create_mask(pattern=pl.MaskPattern.ALL, dtype=pl.DT_FP32)
+     pb = vf.create_mask(pattern=pl.MaskPattern.ALL, dtype=pl.DT_BF16)
+     for r in pl.range(0, rows):
+-        xh0 = vf.load_align(norm_out, r * 128, dist=pl.LoadDist.US_B16)
+-        xh1 = vf.load_align(norm_out, r * 128 + 64, dist=pl.LoadDist.US_B16)
++        xh0 = vf.load_align(norm_out, r * 128, dist=pl.LoadDist.UNPK_B16)
++        xh1 = vf.load_align(norm_out, r * 128 + 64, dist=pl.LoadDist.UNPK_B16)
+         x0 = vf.astype(xh0, pb, dtype=pl.DT_FP32)
+         x1 = vf.astype(xh1, pb, dtype=pl.DT_FP32)
+         d0 = vf.load_align(grad, r * 128)
+@@ -3957,7 +3957,7 @@
+                     cp_tok = cu[cp_seg]
+                     cp_batch = 0
+                 valid_s = seq_len
+-                single_token = seq_len == 1
++                single_token = pl.astype(seq_len == 1, pl.DT_INT64)
+                 rec_b = b
+                 rec_n = n
+                 if has_local_cache == 0:
+@@ -4521,7 +4521,7 @@
+                     cp_tok = cu[cp_seg]
+                     cp_batch = 0
+                 valid_s = seq_len
+-                single_token = seq_len == 1
++                single_token = pl.astype(seq_len == 1, pl.DT_INT64)
+                 rec_b_1 = b_1
+                 rec_n_1 = n_1
+                 mul_10 = num_chunks * num_heads
+@@ -5432,7 +5432,7 @@
+                                     s2_safe_add(final_dq, u2, final_dq, local_rows)
+                                     pl.load(u2, gva_k, [grad_row, 0])
+                                     s2_safe_add(final_dk, u2, final_dk, local_rows)
+-                                    pl.set_validshape(u2, [128, 128])
++                                    pl.set_validshape(u2, [32, 128])
+                                 if cp_member + 1 != ratio:
+                                     pl.store(gva_q, final_dq, [grad_row, 0])
+                                     pl.store(gva_k, final_dk, [grad_row, 0])
+@@ -6055,8 +6055,8 @@
+     p = vf.create_mask(pattern=pl.MaskPattern.ALL, dtype=pl.DT_FP32)
+     pb = vf.create_mask(pattern=pl.MaskPattern.ALL, dtype=pl.DT_BF16)
+     for r in pl.range(0, rows):
+-        xb0 = vf.load_align(raw, r * 128, dist=pl.LoadDist.US_B16)
+-        xb1 = vf.load_align(raw, r * 128 + 64, dist=pl.LoadDist.US_B16)
++        xb0 = vf.load_align(raw, r * 128, dist=pl.LoadDist.UNPK_B16)
++        xb1 = vf.load_align(raw, r * 128 + 64, dist=pl.LoadDist.UNPK_B16)
+         x0 = vf.astype(xb0, pb, dtype=pl.DT_FP32)
+         x1 = vf.astype(xb1, pb, dtype=pl.DT_FP32)
+         d0 = vf.load_align(grad, r * 128)

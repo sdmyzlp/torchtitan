@@ -10,7 +10,7 @@ from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLo
 from torchtitan.components.data.text_datasets import DATASETS
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import AdamW, Optim, OptimizersContainer
-from torchtitan.config import TrainingConfig
+from torchtitan.config import OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.glm53_flash import build_model_config
 from torchtitan.observability.metrics import MetricsProcessor
@@ -51,4 +51,15 @@ def glm53_flash_debugmodel(
     )
     config.debug.seed = 42
     config.debug.deterministic = True
+    return config
+
+
+def glm53_flash_debugmodel_npu(seq_len: int = 4096) -> Trainer.Config:
+    config = glm53_flash_debugmodel(seq_len, model_flavor="debugmodel_4layer")
+    config.override = OverrideConfig(
+        imports=[
+            "torchtitan_recipes.overrides.glm53_flash_npu.ascend_sparse_attention",
+            "torchtitan_recipes.overrides.glm53_flash_pypto.flash_kda",
+        ]
+    )
     return config

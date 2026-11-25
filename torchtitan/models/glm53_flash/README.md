@@ -90,3 +90,40 @@ and 10 AdamW steps.
 
 This commit supports the single-device reference model. Tensor, pipeline, expert,
 data and context parallel degrees greater than one are rejected.
+
+## Ascend fused attention
+
+The Ascend override uses four CANN kernels with a deliberate autograd protocol:
+
+```text
+forward:  lightning_indexer -> (indices, scores) -> sparse_flash_mla
+backward: sparse_flash_mla_grad
+            -> mask invalid token slots, sum each pool's teacher probabilities
+            -> scores.grad = teacher * loss_coeff / global_valid_tokens
+            -> sparse_lightning_indexer_kl_loss_grad
+            -> d(index_q), d(index_k), d(index_weight)
+```
+
+Here `scores.grad` carries `attn_softmax_l1_norm`, not an ordinary score
+Jacobian. The indexer backward computes `softmax(scores) * Z - p` itself.
+The teacher is independent of the upstream LM gradient, including when that
+gradient is zero. Do not insert a score transform between these two boundaries.
+A fixed left window of two would include three tokens even when the tail is
+empty (position 3), so the tail uses explicit indices rather than band mode.
+SMLA treats expanded pools and tail as two full-resolution sparse streams
+(`cmp_ratio=1`); its two KV gradients are added. The tested CANN build requires
+an explicit sink tensor, so the adapter supplies `-inf` sinks with zero mass.
+
+The tested CANN sparse backward initializes short probability tensors without
+skipping vector cores beyond the final partition. The override checks the
+rounded partition sizes against the device's actual vector-core count and
+rejects affected shapes before dispatch. The NPU recipe uses 4,096 tokens and
+the released attention geometry: 64 DSA heads of width 256, KV latent width
+512, 32 index heads of width 128, and 64 KDA heads of width 128. No native CANN package is changed.
+
+See [PyPTO setup](../../../torchtitan_recipes/overrides/GLM53_FLASH_PYPTO.md) for the pinned kernel and compiler patch.
+
+```bash
+NGPU=1 MODULE=torchtitan_recipes.tests.models.glm53_flash_minimal \
+CONFIG=glm53_flash_debugmodel_npu ./run_train.sh
+```
