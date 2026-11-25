@@ -55,7 +55,7 @@ The runtime also needs FSDP's `get_all_gather_copy_in_stream()` when composed
 with FSDP. Older PyTorch builds may lack it. Saved-region replay additionally
 needs native NPU storage for torch_remat placeholders; the generic null-pointer
 storage factory is not sufficient for NPU's storage descriptor. See the
-[NPU remat adapters](../../analysis/glm53-flash-training-features-2026-11-26/npu_remat.py)
+[GLM NPU experiments](../../analysis/glm53-flash-training-features-2026-11-26/README.md#4-cpu-offload区分激活与持久状态)
 for the version-specific probes and opt-in adapters.
 
 **Keeping a block on GPU.** Give it a block override that turns off every

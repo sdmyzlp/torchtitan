@@ -212,3 +212,9 @@ checks. TP/EP/PP/FSDP combinations, compilation, router auxiliary objectives,
 vision, MTP, inference caches and HF checkpoint conversion are outside this
 port. Router correction biases remain frozen. Top-k ties retain backend-specific
 tie breaking; numerical tests compare at the same selected indices.
+
+## Training feature study
+
+The [measured training feature study](../../../analysis/glm53-flash-training-features-2026-11-26/README.md)
+covers rematerialization, SPMD type checking, Grain, CPU offload, and DistMuon
+with reproducible probes and explicit numerical/backend limitations.
