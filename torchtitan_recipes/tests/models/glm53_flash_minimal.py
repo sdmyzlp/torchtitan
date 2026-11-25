@@ -34,6 +34,10 @@ def glm53_flash_debugmodel(
         ),
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+            max_num_documents=seq_len // 4
+            if parallelism.context_parallel_degree > 1
+            else None,
+            per_sample_pad_multiple=4 if parallelism.context_parallel_degree > 1 else 1,
         ),
         optim=Optim.Config(
             optimizer=OptimizersContainer.Config(
@@ -54,12 +58,41 @@ def glm53_flash_debugmodel(
     return config
 
 
-def glm53_flash_debugmodel_npu(seq_len: int = 4096) -> Trainer.Config:
-    config = glm53_flash_debugmodel(seq_len, model_flavor="debugmodel_4layer")
+def glm53_flash_debugmodel_cp2(seq_len: int = 32) -> Trainer.Config:
+    return glm53_flash_debugmodel(
+        seq_len,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=1, context_parallel_degree=2
+        ),
+    )
+
+
+def glm53_flash_debugmodel_npu(
+    seq_len: int = 4096, context_parallel_degree: int = 1
+) -> Trainer.Config:
+    config = glm53_flash_debugmodel(
+        seq_len,
+        model_flavor="debugmodel_4layer",
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=1,
+            context_parallel_degree=context_parallel_degree,
+        ),
+    )
     config.override = OverrideConfig(
         imports=[
             "torchtitan_recipes.overrides.glm53_flash_npu.ascend_sparse_attention",
             "torchtitan_recipes.overrides.glm53_flash_pypto.flash_kda",
         ]
     )
+    if context_parallel_degree > 1:
+        # PyPTO KCP requires continuing fragments to end on a 64-token boundary.
+        if seq_len % (64 * context_parallel_degree):
+            raise ValueError("PyPTO KCP requires seq_len divisible by 64 * CP degree.")
+        assert isinstance(config.dataloader, GrainDataLoader.Config)
+        config.dataloader.per_sample_pad_multiple = 64
+        config.dataloader.max_num_documents = seq_len // 64
     return config
+
+
+def glm53_flash_debugmodel_npu_cp2(seq_len: int = 4096) -> Trainer.Config:
+    return glm53_flash_debugmodel_npu(seq_len, context_parallel_degree=2)

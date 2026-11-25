@@ -15,6 +15,7 @@ T = packed tokens, H = heads, K = key width, V = value width (K = V = 128).
 from dataclasses import dataclass
 
 from torchtitan.config import derive, override
+from torchtitan.models.glm53_flash.cp_kda import ContextParallelKDAKernel
 from torchtitan.models.glm53_flash.model import ReferenceKDAKernel
 
 
@@ -51,6 +52,42 @@ class PyPTOKDAKernel(ReferenceKDAKernel):
         )[0]
 
 
+class PyPTOContextParallelKDAKernel(ContextParallelKDAKernel):
+    @dataclass(kw_only=True, slots=True)
+    class Config(ContextParallelKDAKernel.Config):
+        pass
+
+    def forward(
+        self,
+        q_1THK,
+        k_1THK,
+        v_1THV,
+        raw_gate_1THK,
+        raw_beta_1TH,
+        A_log_H,
+        dt_bias_HK,
+        *,
+        attention_metadata,
+    ):
+        from ops.pypto_pro.kimi_k3.flash_kda.op_kernel import chunk_kda
+
+        return chunk_kda(
+            q_1THK,
+            k_1THK,
+            v_1THV,
+            raw_gate_1THK,
+            raw_beta_1TH,
+            A_log=A_log_H,
+            dt_bias=dt_bias_HK,
+            lower_bound=self.lower_bound,
+            cu_seqlens=attention_metadata.cu_seqlens,
+            cu_seqlens_cpu=attention_metadata.cu_seqlens_cpu,
+            cp_context=attention_metadata.context,
+        )[0]
+
+
 @override(target=ReferenceKDAKernel.Config)
 def flash_kda(cfg: ReferenceKDAKernel.Config):
+    if isinstance(cfg, ContextParallelKDAKernel.Config):
+        return derive(cfg, PyPTOContextParallelKDAKernel.Config)
     return derive(cfg, PyPTOKDAKernel.Config)

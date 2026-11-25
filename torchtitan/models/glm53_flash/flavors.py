@@ -217,7 +217,7 @@ def build_model_config(
     seq_len: int | None = None,
     parallelism: ParallelismConfig | None = None,
 ) -> Glm53FlashModel.Config:
-    """Build the single-device reference model."""
+    """Build the reference model with optional contiguous context parallelism."""
     if flavor not in MODEL_FLAVORS:
         raise ValueError(f"Unknown GLM-5.3-Flash flavor: {flavor}")
     p = parallelism or ParallelismConfig()
@@ -229,10 +229,11 @@ def build_model_config(
             "tensor_parallel_degree",
             "pipeline_parallel_degree",
             "expert_parallel_degree",
-            "context_parallel_degree",
         )
     ):
-        raise NotImplementedError("This minimal port supports single-device execution.")
+        raise NotImplementedError(
+            "This minimal port supports single-device and contiguous context parallel execution."
+        )
     seq_len = MODEL_FLAVORS[flavor] if seq_len is None else seq_len
     if not 0 < seq_len <= MODEL_FLAVORS[flavor]:
         raise ValueError(f"seq_len must be in [1, {MODEL_FLAVORS[flavor]}]")
@@ -297,4 +298,12 @@ def build_model_config(
             for i in range(layers)
         ],
     )
+    if p.context_parallel_degree > 1:
+        from .parallelize import GlmContextParallelTransform
+
+        if p.context_parallel_load_balancer is not None:
+            raise ValueError(
+                "GLM context parallel requires contiguous shards (no load balancer)."
+            )
+        GlmContextParallelTransform().transform(config)
     return config

@@ -6,6 +6,8 @@
 
 """Released attention geometry against an independent FP32 attention/KL oracle."""
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ pytest.importorskip("cann_ops_transformer")
 
 from torchtitan.models.glm53_flash.attention import IndexerLoss
 from torchtitan_recipes.overrides.glm53_flash_npu import (
+    AscendAllGatherKVSparseAttention,
     AscendInnerIndexer,
     AscendSparseAttention,
 )
@@ -29,7 +32,8 @@ def deterministic():
 
 
 @pytest.mark.parametrize("trunk_scale", [0.0, 1.0])
-def test_teacher_bridge_matches_explicit_kl(trunk_scale):
+@pytest.mark.parametrize("query_start", [0, 2048])
+def test_teacher_bridge_matches_explicit_kl(trunk_scale, query_start):
     num_kv, heads, latent_dim, index_heads, index_dim, topk = (
         4096,
         64,
@@ -51,6 +55,17 @@ def test_teacher_bridge_matches_explicit_kl(trunk_scale):
         positions, max_num_documents=4, max_context_length=num_kv
     )
     pools = metadata.pool_rows_PW.size(0)
+    if query_start:
+        # Exercise a CP query fragment against full keys without a second device.
+        group = Mock()
+        group.size.return_value = 2
+        with patch(
+            "torchtitan.models.glm53_flash.cp_dsa.spmd_mesh_group", return_value=group
+        ), patch("torch.distributed.get_rank", return_value=1):
+            metadata = AscendAllGatherKVSparseAttention.prepare_cp_metadata(
+                metadata, permutation=None
+            )
+        positions = positions[query_start:]
     num_q = positions.numel()
     # All native kernels see the complete geometry. A sampled query objective
     # keeps the independent FP32 autograd oracle's gathered KV memory bounded.

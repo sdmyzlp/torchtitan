@@ -24,6 +24,12 @@ from torchtitan.models.glm53_flash.attention import (
     SparseMetadata,
 )
 
+from torchtitan.models.glm53_flash.cp_dsa import (
+    AllGatherInnerIndexer,
+    AllGatherKVSparseAttention,
+    CPSparseMetadata,
+)
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AscendSparseMetadata(SparseMetadata):
@@ -39,7 +45,13 @@ class AscendSparseMetadata(SparseMetadata):
     sinks: torch.Tensor | None = None
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AscendCPSparseMetadata(CPSparseMetadata, AscendSparseMetadata):
+    pass
+
+
 register_dataclass(AscendSparseMetadata)
+register_dataclass(AscendCPSparseMetadata)
 
 
 def _global_metadata(config, positions, **kwargs):
@@ -353,6 +365,38 @@ class AscendSparseAttention(SparseAttention):
         )[..., :width]
 
 
+class AscendAllGatherKVSparseAttention(
+    AllGatherKVSparseAttention, AscendSparseAttention
+):
+    @dataclass(kw_only=True, slots=True)
+    class Config(AllGatherKVSparseAttention.Config, AscendSparseAttention.Config):
+        def build_attention_metadata(self, positions, **kwargs):
+            return _global_metadata(self, positions, **kwargs)
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        local = AllGatherKVSparseAttention.prepare_cp_metadata(
+            attention_metadata, permutation=permutation
+        )
+        return _build_kernel_metadata(
+            AscendCPSparseMetadata(
+                **{
+                    **{
+                        f.name: getattr(attention_metadata, f.name)
+                        for f in fields(AscendSparseMetadata)
+                    },
+                    **{f.name: getattr(local, f.name) for f in fields(SparseMetadata)},
+                }
+            )
+        )
+
+
+class AscendAllGatherInnerIndexer(AllGatherInnerIndexer, AscendInnerIndexer):
+    @dataclass(kw_only=True, slots=True)
+    class Config(AllGatherInnerIndexer.Config, AscendInnerIndexer.Config):
+        pass
+
+
 @override(
     target=GlmDSA.Config,
     description="GLM pooled sparse attention and indexer KL on Ascend 950",
@@ -364,12 +408,22 @@ def ascend_sparse_attention(cfg: GlmDSA.Config) -> GlmDSA.Config:
         raise ValueError(
             "Ascend sparse attention requires latent width <=512 and index width <=128."
         )
+    attention_cls = (
+        AscendAllGatherKVSparseAttention.Config
+        if isinstance(cfg.inner_attention, AllGatherKVSparseAttention.Config)
+        else AscendSparseAttention.Config
+    )
+    indexer_cls = (
+        AscendAllGatherInnerIndexer.Config
+        if isinstance(cfg.indexer.inner_indexer, AllGatherInnerIndexer.Config)
+        else AscendInnerIndexer.Config
+    )
     return derive(
         cfg,
         GlmDSA.Config,
         inner_attention=derive(
             cfg.inner_attention,
-            AscendSparseAttention.Config,
+            attention_cls,
             num_heads=cfg.n_heads,
             num_index_heads=cfg.indexer.num_index_heads,
             topk=cfg.indexer.inner_indexer.topk,
@@ -377,6 +431,6 @@ def ascend_sparse_attention(cfg: GlmDSA.Config) -> GlmDSA.Config:
         indexer=derive(
             cfg.indexer,
             type(cfg.indexer),
-            inner_indexer=derive(cfg.indexer.inner_indexer, AscendInnerIndexer.Config),
+            inner_indexer=derive(cfg.indexer.inner_indexer, indexer_cls),
         ),
     )
