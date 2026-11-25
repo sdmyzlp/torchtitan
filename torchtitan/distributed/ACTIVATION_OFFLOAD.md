@@ -42,8 +42,21 @@ at a missing region.
 When the policy offloads anything, `ActivationRematConfig.apply` checkpoints
 the blocks and installs an `ActivationOffloader` on the model part; its
 forward hooks keep it alive, so nothing holds a handle to it. Offloading
-requires CUDA: `apply` raises on other accelerators. Every block `apply`
-checkpoints is offloaded according to its policy; no block is special-cased.
+requires accelerator streams/events, pinned host memory, asynchronous copies,
+and a device-module `is_current_stream_capturing()` query for buffer reuse.
+`apply` rejects a missing accelerator or capture query. CUDA and NPU use the
+same runtime through `device_module`; no vendor package is imported here.
+Every block `apply` checkpoints is offloaded according to its policy; no
+block is special-cased.
+
+NPU validation covers eager offloading and a whole forward/backward `NPUGraph`
+with pinned-buffer reuse. This does not enable the separate GraphTrainer path.
+The runtime also needs FSDP's `get_all_gather_copy_in_stream()` when composed
+with FSDP. Older PyTorch builds may lack it. Saved-region replay additionally
+needs native NPU storage for torch_remat placeholders; the generic null-pointer
+storage factory is not sufficient for NPU's storage descriptor. See the
+[NPU remat adapters](../../analysis/glm53-flash-training-features-2026-11-26/npu_remat.py)
+for the version-specific probes and opt-in adapters.
 
 **Keeping a block on GPU.** Give it a block override that turns off every
 offload field the base policy sets. The usual case is the block that runs
@@ -95,7 +108,7 @@ Never offloaded, whatever the config:
   race with resharding;
 - storages shared with the model part's input: the caller (e.g. a pipeline
   stage) holds them;
-- tensors that are not plain CUDA tensors;
+- tensors that are not plain tensors on the active accelerator;
 - storages under 1 MiB (routing metadata, loss scalars): no measurable saving.
 
 A storage that something other than autograd frees before the free point

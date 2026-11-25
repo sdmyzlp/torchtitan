@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
+import torch_remat as remat
 from torch import nn
 from torch.export import register_dataclass
 
@@ -69,8 +70,10 @@ class Compressor(Module):
 
     def forward(self, k_TE, x_TD, *, attention_metadata: SparseMetadata):
         rows_PW = attention_metadata.pool_rows_PW
+        logits_TE = self.gate(x_TD)
+        remat.recompute_needs_tensor(k_TE, logits_TE)
         k_PWE = k_TE[rows_PW]
-        logits_PWE = self.gate(x_TD)[rows_PW].float() + self.ape.float()
+        logits_PWE = logits_TE[rows_PW].float() + self.ape.float()
         return (logits_PWE.softmax(1).to(k_TE.dtype) * k_PWE).sum(1)
 
 
@@ -146,16 +149,19 @@ class Indexer(Module):
         q_TIE = self.wq_b(q_TD).unflatten(
             -1, (self.num_index_heads, self.index_head_dim)
         )
+        k_TE = self.wk(x_TD)
+        remat.recompute_needs_tensor(k_TE)
         k_PE = self.compressor(
-            self.k_norm(self.wk(x_TD)), x_TD, attention_metadata=attention_metadata
+            self.k_norm(k_TE), x_TD, attention_metadata=attention_metadata
         )
-        w_TI = (
-            self.weights_proj(x_TD)
-            * (self.index_head_dim * self.num_index_heads) ** -0.5
-        )
-        return self.inner_indexer(
-            q_TIE, k_PE, w_TI, attention_metadata=attention_metadata
-        )
+        w_TI = self.weights_proj(x_TD)
+        remat.recompute_needs_tensor(w_TI)
+        w_TI = w_TI * (self.index_head_dim * self.num_index_heads) ** -0.5
+        return remat.region(
+            self.inner_indexer,
+            self.remat_region_name("inner_indexer"),
+            recompute=self.remat_should_recompute("inner_indexer"),
+        )(q_TIE, k_PE, w_TI, attention_metadata=attention_metadata)
 
 
 class IndexerLoss(AuxLoss):
@@ -407,16 +413,25 @@ class GlmDSA(Attention):
         padding_mask=None,
         aux_loss_denominator=None
     ):
-        q_TD = self.q_norm(self.wq_a(x_TD))
+        q_TD = self.wq_a(x_TD)
+        remat.recompute_needs_tensor(q_TD)
+        q_TD = self.q_norm(q_TD)
         q_THK = self.wq_b(q_TD).unflatten(-1, (self.n_heads, self.head_dim))
-        kv_TL = self.kv_norm(self.wkv_a(x_TD))
+        kv_TL = self.wkv_a(x_TD)
+        remat.recompute_needs_tensor(kv_TL)
+        kv_TL = self.kv_norm(kv_TL)
         w_HKL = self.wkv_b.weight.unflatten(0, (self.n_heads, 2 * self.head_dim))
         w_uk_HKL, w_uv_HKL = w_HKL.chunk(2, dim=1)
+        remat.recompute_needs_tensor(q_THK)
         q_THL = torch.einsum("thk,hkl->thl", q_THK, w_uk_HKL)
         indices_TS, scores_TS = self.indexer(
             q_TD.detach(), x_TD.detach(), attention_metadata=attention_metadata
         )
-        out_THL = self.inner_attention(
+        out_THL = remat.region(
+            self.inner_attention,
+            self.remat_region_name("inner_attention"),
+            recompute=self.remat_should_recompute("inner_attention"),
+        )(
             q_THL,
             kv_TL,
             indices_TS,
@@ -426,5 +441,6 @@ class GlmDSA(Attention):
             padding_mask=padding_mask,
             aux_loss_denominator=aux_loss_denominator,
         )
+        remat.recompute_needs_tensor(out_THL)
         out_THK = torch.einsum("thl,hkl->thk", out_THL, w_uv_HKL)
         return self.wo(out_THK.flatten(-2))

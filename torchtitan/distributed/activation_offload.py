@@ -48,6 +48,7 @@ from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from torch.utils._pytree import tree_flatten
 
 from torchtitan.models.base.module import Module
+from torchtitan.tools.utils import device_module, device_type
 
 if TYPE_CHECKING:
     from torchtitan.distributed.activation_remat import (
@@ -264,7 +265,7 @@ class _PinnedBufferPool:
             int, collections.deque[tuple[torch.Tensor, torch.Event, bool]]
         ] = {}
 
-    def acquire(self, nbytes: int, copy_stream: torch.cuda.Stream) -> torch.Tensor:
+    def acquire(self, nbytes: int, copy_stream: torch.Stream) -> torch.Tensor:
         """Return an ``nbytes`` view of a buffer that ``copy_stream`` may write
         once it is current."""
         # The smallest power of two >= nbytes; requesting exactly that makes
@@ -277,10 +278,10 @@ class _PinnedBufferPool:
         # oldest release is the least likely to stall the copy stream.
         buffer, last_read, recorded_during_capture = free.popleft()
         # An event recorded in the other mode (eager vs capture) cannot be
-        # waited on, and its read is ordered anyway: torch.cuda.graph
+        # waited on, and its read is ordered anyway: device_module.graph
         # synchronizes before capture, and a replay runs on the compute
         # stream, which the copy stream waits on before each copy.
-        if recorded_during_capture == torch.cuda.is_current_stream_capturing():
+        if recorded_during_capture == device_module.is_current_stream_capturing():
             copy_stream.wait_event(last_read)
         return buffer[:nbytes]
 
@@ -290,7 +291,7 @@ class _PinnedBufferPool:
         buffer = view._base
         assert buffer is not None
         self._free.setdefault(buffer.nbytes, collections.deque()).append(
-            (buffer, last_read, torch.cuda.is_current_stream_capturing())
+            (buffer, last_read, device_module.is_current_stream_capturing())
         )
 
 
@@ -317,8 +318,8 @@ class ActivationOffloader:
         # One stream per copy direction: one microbatch's offload and
         # another's reload can run at once (sharing host bandwidth, see
         # ACTIVATION_OFFLOAD.md), and a reload never queues behind an offload.
-        self._offload_stream = torch.cuda.Stream()
-        self._reload_stream = torch.cuda.Stream()
+        self._offload_stream = device_module.Stream()
+        self._reload_stream = device_module.Stream()
         self._host_buffers = _PinnedBufferPool()
         # FSDP2's all-gather copy-in stream, which reloads also wait on (see
         # _reload). Set at each model-part forward: fully_shard runs after
@@ -538,12 +539,12 @@ class ActivationOffloader:
             "across transformer blocks"
         )
         kind = info.kind
-        if type(tensor) is not torch.Tensor or tensor.device.type != "cuda":
+        if type(tensor) is not torch.Tensor or tensor.device.type != device_type:
             # A subclass parameter (FSDP2's unsharded MXFP8 weight) is a weight,
             # not a retained activation: all its storages are parameter storages.
             if _storages(tensor).issubset(group.parameter_storages):
                 return tensor
-            return self._skip(tensor, "not a plain CUDA tensor")
+            return self._skip(tensor, f"not a plain {device_type} tensor")
         policy = self._block_policies[group.module_fqn]
         storage_ptr = tensor.untyped_storage().data_ptr()
         # An already-offloaded storage is offloaded for every save of it.
@@ -620,8 +621,8 @@ class ActivationOffloader:
         device_tensor.set_(storage)
         host_buffer = self._host_buffers.acquire(storage.nbytes(), self._offload_stream)
         # Start the copy only after the compute stream has produced the tensor.
-        self._offload_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._offload_stream):
+        self._offload_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self._offload_stream):
             host_buffer.copy_(device_tensor, non_blocking=True)
         self.forward_stats.offloaded_bytes += storage.nbytes()
         return _OffloadedStorage(
@@ -636,7 +637,7 @@ class ActivationOffloader:
         # allocator could hand it to later compute while the copy reads it.
         # This group's event, not the whole offload stream, so later groups'
         # copies do not delay compute.
-        torch.cuda.current_stream().wait_event(group.copy_done_event)
+        device_module.current_stream().wait_event(group.copy_done_event)
         for offloaded in group.storages.values():
             if offloaded.state is _State.OFFLOADING:
                 assert offloaded.device_tensor is not None
@@ -759,8 +760,8 @@ class ActivationOffloader:
         # Allocated on the compute stream, so freed in its order. The reload
         # stream waits on the compute stream, which orders the copy after this
         # allocation and after FSDP2's copy-out (see _prefetch_on_grad).
-        device_tensor = torch.empty_like(host_buffer, device="cuda")
-        self._reload_stream.wait_stream(torch.cuda.current_stream())
+        device_tensor = torch.empty_like(host_buffer, device=device_type)
+        self._reload_stream.wait_stream(device_module.current_stream())
         if self._fsdp_copy_in_stream is not None:
             # Parameters first: FSDP2's pre-backward queued the previous
             # block's copy-in (its H2D shard copies under CPU offload) just
@@ -768,7 +769,7 @@ class ActivationOffloader:
             # this reload instead of following both. An idle-stream wait when
             # FSDP2 unshards on the current stream.
             self._reload_stream.wait_stream(self._fsdp_copy_in_stream)
-        with torch.cuda.stream(self._reload_stream):
+        with device_module.stream(self._reload_stream):
             device_tensor.copy_(host_buffer, non_blocking=True)
             offloaded.reload_event = self._reload_stream.record_event()
         # The next D2H copy into this buffer waits on the reload event.
@@ -799,7 +800,7 @@ class ActivationOffloader:
             )
         if offloaded.state is _State.RELOADING:
             assert offloaded.reload_event is not None
-            torch.cuda.current_stream().wait_event(offloaded.reload_event)
+            device_module.current_stream().wait_event(offloaded.reload_event)
         # Otherwise still OFFLOADING: the GPU copy has not been freed yet.
         assert offloaded.device_tensor is not None
         # The reloaded copy holds the whole storage, so the saved tensor is the

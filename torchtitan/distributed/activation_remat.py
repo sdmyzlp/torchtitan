@@ -18,6 +18,7 @@ import torch_remat as remat
 
 from torchtitan.distributed.activation_offload import ActivationOffloader
 from torchtitan.models.base.module import Module
+from torchtitan.tools.utils import device_module
 
 
 logger = logging.getLogger(__name__)
@@ -284,12 +285,12 @@ class ActivationRematConfig:
 
         accelerator = torch.accelerator.current_accelerator()
         if self.offloads_activations and (
-            accelerator is None or accelerator.type != "cuda"
+            accelerator is None
+            or not hasattr(device_module, "is_current_stream_capturing")
         ):
-            # TODO: other accelerators need a graph-capture query for the
-            # pinned buffer pool's reuse rule; streams and events would port.
             raise ValueError(
-                "Activation offload requires CUDA, but the accelerator is "
+                "Activation offload requires an accelerator with streams, pinned "
+                "memory and is_current_stream_capturing(), but the accelerator is "
                 f"{accelerator}. Keep offload_block_input and offload_regions off."
             )
 

@@ -33,6 +33,7 @@ from torchtitan.distributed.activation_remat import (
 from torchtitan.models.base.module import Module, ModuleDict
 from torchtitan.models.common.linear import Linear
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
+from torchtitan.tools.utils import device_module, device_type
 
 # Legend: T = tokens, D = model dim, F = hidden dim.
 
@@ -340,7 +341,7 @@ def _build_encoder_decoder(
     _apply(
         remat_config, model, block_container_fqns=["vision_encoder.layers", "layers"]
     )
-    return model.cuda()
+    return model.to(device_type)
 
 
 def _build(
@@ -350,7 +351,7 @@ def _build(
     anything."""
     model = deepcopy(reference) if reference is not None else _Model()
     _apply(remat_config, model)
-    return model.cuda()
+    return model.to(device_type)
 
 
 def _without_offload(remat_config: ActivationRematConfig) -> ActivationRematConfig:
@@ -390,12 +391,18 @@ def _grads(model: _Model, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
     return [p.grad.detach().clone() for p in model.parameters()]
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@unittest.skipUnless(
+    torch.accelerator.is_available()
+    and hasattr(device_module, "is_current_stream_capturing"),
+    "requires accelerator streams and a capture query",
+)
 class TestActivationOffload(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
         self.reference = _Model()
-        self.inputs = [torch.randn(_NUM_TOKENS, _DIM, device="cuda") for _ in range(2)]
+        self.inputs = [
+            torch.randn(_NUM_TOKENS, _DIM, device=device_type) for _ in range(2)
+        ]
 
     def _assert_bitwise_equal(self, remat_config: ActivationRematConfig) -> _Model:
         """Compare against the same remat policy without offloading."""
@@ -509,7 +516,8 @@ class TestActivationOffload(unittest.TestCase):
         self.reference = _Model(_SubclassSaveBlock)
         model = self._assert_bitwise_equal(_save_all(["*"]))
         self.assertIn(
-            "not a plain CUDA tensor", _offloader(model).forward_stats.skipped_bytes
+            f"not a plain {device_type} tensor",
+            _offloader(model).forward_stats.skipped_bytes,
         )
 
     def test_storage_freed_elsewhere_raises(self):
@@ -595,11 +603,11 @@ class TestActivationOffload(unittest.TestCase):
             # block forward refers back to its block); collect them now so
             # they are not freed in the middle of the measurement.
             gc.collect()
-            torch.cuda.synchronize()
-            before = torch.cuda.memory_allocated()
+            device_module.synchronize()
+            before = device_module.memory_allocated()
             loss = model(self.inputs[0].clone().requires_grad_(True)).square().mean()
-            torch.cuda.synchronize()
-            stashed = torch.cuda.memory_allocated() - before
+            device_module.synchronize()
+            stashed = device_module.memory_allocated() - before
             loss.backward()
             return stashed
 
@@ -644,17 +652,17 @@ class TestActivationOffload(unittest.TestCase):
 
         def bytes_after_backward(model: _Model) -> int:
             gc.collect()
-            torch.cuda.synchronize()
-            before = torch.cuda.memory_allocated()
+            device_module.synchronize()
+            before = device_module.memory_allocated()
             losses = [
                 model(x_TD.clone().requires_grad_(True)).square().mean()
                 for x_TD in self.inputs
             ]
             for loss in losses:
                 loss.backward()
-            torch.cuda.synchronize()
+            device_module.synchronize()
             # `losses` is still alive here, as in a training loop that logs it.
-            return torch.cuda.memory_allocated() - before
+            return device_module.memory_allocated() - before
 
         baseline = _build(FullActivationRematConfig(), self.reference)
         offloaded = _build(_full_remat_offloading_inputs(), self.reference)
@@ -665,41 +673,55 @@ class TestActivationOffload(unittest.TestCase):
             bytes_after_backward(offloaded), bytes_after_backward(baseline)
         )
 
-    def test_cuda_graph_reuses_host_buffers(self):
+    @unittest.skipUnless(device_type in ("cuda", "npu"), "requires CUDA or NPU graphs")
+    def test_graph_reuses_host_buffers(self):
         """A captured gradient-accumulation step replays bitwise equal to eager,
         reuses one microbatch's pinned buffers across microbatches, and mixes
         with eager steps that share those buffers."""
-        expected = _grads(
-            _build(FullActivationRematConfig(), self.reference), self.inputs
-        )
+        if device_type == "npu":
+            self.addCleanup(
+                torch.use_deterministic_algorithms,
+                torch.are_deterministic_algorithms_enabled(),
+            )
+            torch.use_deterministic_algorithms(True)
         model = _build(_full_remat_offloading_inputs(), self.reference)
         static_inputs = [x_TD.clone().requires_grad_(True) for x_TD in self.inputs]
 
-        def step() -> None:
+        def step(target: _Model) -> None:
             for x_TD in static_inputs:
-                model(x_TD).square().mean().backward()
+                target(x_TD).square().mean().backward()
+
+        baseline = _build(FullActivationRematConfig(), self.reference)
+        # Match capture's persistent grad buffers: accumulating into zero may
+        # use a different GEMM path from allocating a new gradient on NPU.
+        for parameter in baseline.parameters():
+            parameter.grad = torch.zeros_like(parameter)
+        step(baseline)
+        expected = [
+            parameter.grad.detach().clone() for parameter in baseline.parameters()
+        ]
 
         def check_grads() -> None:
             for e, p in zip(expected, model.parameters(), strict=True):
                 torch.testing.assert_close(p.grad, e, rtol=0, atol=0)
 
-        side_stream = torch.cuda.Stream()
-        side_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side_stream):
+        side_stream = device_module.Stream()
+        side_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(side_stream):
             model.zero_grad(set_to_none=False)
-            step()
-        torch.cuda.current_stream().wait_stream(side_stream)
+            step(model)
+        device_module.current_stream().wait_stream(side_stream)
         model.zero_grad(set_to_none=False)
         _collect_garbage_before_capture()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            step()
+        graph = getattr(device_module, f"{device_type.upper()}Graph")()
+        with device_module.graph(graph):
+            step(model)
         for _ in range(2):
             model.zero_grad(set_to_none=False)
             graph.replay()
             check_grads()
             model.zero_grad(set_to_none=False)
-            step()
+            step(model)
             check_grads()
         # Blocks 1..5 offload one input each; the second microbatch reuses
         # the first one's buffers, in eager mode and in the graph alike.
@@ -715,7 +737,7 @@ class TestActivationOffload(unittest.TestCase):
         model = _build(_full_remat_offloading_inputs(), self.reference)
         # Each block input is T * D fp32: 12-16 MiB, all in the 16 MiB class.
         for num_tokens in (_NUM_TOKENS, 3500, 3072, 4000):
-            inputs = [torch.randn(num_tokens, _DIM, device="cuda")]
+            inputs = [torch.randn(num_tokens, _DIM, device=device_type)]
             for e, a in zip(
                 _grads(baseline, inputs), _grads(model, inputs), strict=True
             ):

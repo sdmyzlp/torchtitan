@@ -10,6 +10,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from torchtitan.distributed.activation_remat import (
+    ActivationRematConfig,
+    BlockRematOverride,
+    FullActivationRematConfig,
+)
 from torchtitan.models.glm53_flash import build_model_config
 
 
@@ -89,6 +94,39 @@ def test_causal_prefix_and_optimizer_steps():
         optimizer.step()
         losses.append(loss.item())
     assert losses[-1] < losses[0], losses
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        FullActivationRematConfig(),
+        ActivationRematConfig(
+            save_regions=["*"], recompute_regions=["*routed_experts.w13.*"]
+        ),
+        ActivationRematConfig(
+            save_regions=["*"],
+            block_overrides=[BlockRematOverride(blocks=["layers.3"], save_regions=[])],
+        ),
+    ],
+)
+def test_remat_retains_bare_consumers_and_preserves_all_gradients(policy):
+    reference = _model()
+    actual = copy.deepcopy(reference)
+    policy.apply(actual)
+    tokens = torch.randint(0, 256, (32,))
+    expected = _forward(reference, tokens, [12, 20])
+    output = _forward(actual, tokens, [12, 20])
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    output.square().mean().backward()
+    expected.square().mean().backward()
+    for (name, parameter), (_, ref) in zip(
+        actual.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        if parameter.requires_grad:
+            assert parameter.grad is not None, name
+            torch.testing.assert_close(
+                parameter.grad, ref.grad, rtol=0, atol=0, msg=name
+            )
 
 
 def _hf_config():

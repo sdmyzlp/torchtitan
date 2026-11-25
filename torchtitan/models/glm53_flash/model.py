@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
+import torch_remat as remat
 from torch import nn
 from torch.export import register_dataclass
 
@@ -281,6 +282,7 @@ class GlmHcPost(Module):
         super().__init__()
 
     def forward(self, x_TD, residual_TMD, post_TM, comb_TMM):
+        remat.recompute_needs_tensor(x_TD)
         return (
             post_TM.to(x_TD.dtype)[..., None] * x_TD[:, None]
             + comb_TMM.to(x_TD.dtype).transpose(-1, -2) @ residual_TMD

@@ -317,13 +317,22 @@ class TestActivationCheckpointing(unittest.TestCase):
             ["vision_encoder.layers.7", "layers.82", "mtp_layers.0"],
         )
 
-    def test_offloading_requires_cuda(self):
+    def test_offloading_requires_accelerator_and_capture_query(self):
         with unittest.mock.patch.object(
             torch.accelerator, "current_accelerator", return_value=None
-        ), self.assertRaisesRegex(ValueError, "requires CUDA"):
+        ), self.assertRaisesRegex(ValueError, "requires an accelerator"):
             ActivationRematConfig(save_regions=["*"], offload_block_input=True).apply(
                 ToyModel(("82",))
             )
+
+        with unittest.mock.patch.object(
+            torch.accelerator, "current_accelerator", return_value=torch.device("cuda")
+        ), unittest.mock.patch(
+            "torchtitan.distributed.activation_remat.device_module", spec=[]
+        ), self.assertRaisesRegex(
+            ValueError, "is_current_stream_capturing"
+        ):
+            FullActivationRematConfig(offload_block_input=True).apply(ToyModel(("82",)))
 
     def test_block_overrides_are_validated(self):
         for name, override_factory, message in (
